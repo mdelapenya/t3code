@@ -58,6 +58,14 @@ describes the server. Process replacement belongs to the launcher's
 [update protocol](./server-updates.md); the connection runtime handles the
 resulting disconnect.
 
+Docker Sandboxes are provisioning, not a connection kind. Desktop main shells
+out to the `sbx` CLI ([apps/desktop/src/sbx](../../apps/desktop/src/sbx)) to
+install it, create a sandbox with the t3code kit preapplied, and then hands the
+resulting `<name>.sbx` host to the ordinary SSH flow above — the persisted
+profile is a plain SSH profile and nothing downstream knows sandboxes exist.
+Removing such an environment replaces the generic removal confirmation with a
+single dialog offering to keep the sandbox running or delete it.
+
 ### Desktop without a local environment
 
 Desktop normally launches its own primary server, but the desktop setting `localEnvironmentEnabled`
