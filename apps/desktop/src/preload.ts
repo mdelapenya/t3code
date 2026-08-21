@@ -161,6 +161,10 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   },
   resolveSshPasswordPrompt: (requestId, password) =>
     ipcRenderer.invoke(IpcChannels.RESOLVE_SSH_PASSWORD_PROMPT_CHANNEL, { requestId, password }),
+  probeSbx: () => ipcRenderer.invoke(IpcChannels.PROBE_SBX_CHANNEL),
+  installSbx: () => ipcRenderer.invoke(IpcChannels.INSTALL_SBX_CHANNEL),
+  createSbxSandbox: (input) => ipcRenderer.invoke(IpcChannels.CREATE_SBX_SANDBOX_CHANNEL, input),
+  removeSbxSandbox: (name) => ipcRenderer.invoke(IpcChannels.REMOVE_SBX_SANDBOX_CHANNEL, { name }),
   getServerExposureState: () => ipcRenderer.invoke(IpcChannels.GET_SERVER_EXPOSURE_STATE_CHANNEL),
   setServerExposureMode: (mode) =>
     ipcRenderer.invoke(IpcChannels.SET_SERVER_EXPOSURE_MODE_CHANNEL, mode),
