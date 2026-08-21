@@ -463,6 +463,102 @@ export const DesktopSshPasswordPromptResolutionInputSchema = Schema.Struct({
   password: Schema.NullOr(Schema.String),
 });
 
+// Docker Sandboxes (sbx) provisioning. The sbx CLI runs on the desktop
+// machine; a created sandbox is then connected as an ordinary SSH
+// environment at <name>.sbx, so nothing downstream of provisioning is
+// sandbox-specific.
+export const DesktopSbxInstallMethodSchema = Schema.Literals(["homebrew", "winget", "manual"]);
+export type DesktopSbxInstallMethod = typeof DesktopSbxInstallMethodSchema.Type;
+
+// Every sandbox is reachable over SSH at <name>.sbx (via the managed
+// ssh_config written by `sbx setup ssh`), with a fixed in-sandbox user.
+export const SBX_SSH_HOST_SUFFIX = ".sbx";
+export const SBX_SSH_USERNAME = "agent";
+
+// The t3code kit preinstalls the t3 npm package and the C++ toolchain
+// node-pty needs on Linux, so the first SSH connect works without compiling
+// anything inside the sandbox. It is not optional: without it a fresh sandbox
+// has no compiler and the remote t3 install fails silently.
+export const SBX_REQUIRED_KIT = "docker.io/sbx/t3code-kit:latest";
+
+export const SBX_OPTIONAL_KITS = [
+  {
+    reference: "docker.io/sbx/github-ssh-kit:latest",
+    label: "GitHub SSH host keys",
+    description: "Pre-trusts GitHub host keys so git over SSH works without prompts.",
+  },
+  {
+    reference: "docker.io/sbx/git-ssh-sign-kit:latest",
+    label: "Git SSH commit signing",
+    description: "Signs commits with the SSH key forwarded from the host agent.",
+  },
+] as const;
+
+// The agent positional mainly selects the sandbox's template image; T3 Code
+// drives its own provider CLIs through the tunneled t3 server either way.
+export const SBX_AGENTS = ["claude", "codex", "cursor", "gemini", "opencode", "shell"] as const;
+export type SbxAgent = (typeof SBX_AGENTS)[number];
+export const SBX_DEFAULT_AGENT: SbxAgent = "claude";
+
+export const isSbxSshHostname = (hostname: string): boolean =>
+  hostname.endsWith(SBX_SSH_HOST_SUFFIX) && hostname.length > SBX_SSH_HOST_SUFFIX.length;
+
+export const sbxSandboxNameFromHostname = (hostname: string): string | null =>
+  isSbxSshHostname(hostname) ? hostname.slice(0, -SBX_SSH_HOST_SUFFIX.length) : null;
+
+export const sbxSshHostnameForSandbox = (name: string): string => `${name}${SBX_SSH_HOST_SUFFIX}`;
+
+// Mirrors the CLI's own rules: at least two characters, starting with a letter
+// or number, only letters, numbers, hyphens and periods; "default" is reserved.
+export const validateSbxSandboxName = (name: string): string | null => {
+  const trimmed = name.trim();
+  if (trimmed.length < 2) {
+    return "Sandbox name needs at least two characters.";
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/u.test(trimmed)) {
+    return "Sandbox name may only contain letters, numbers, hyphens and periods, and must start with a letter or number.";
+  }
+  if (trimmed.toLowerCase() === "default") {
+    return "The sandbox name “default” is reserved.";
+  }
+  return null;
+};
+
+export const DesktopSbxSandboxSchema = Schema.Struct({
+  name: Schema.String,
+  agent: Schema.NullOr(Schema.String),
+  status: Schema.NullOr(Schema.String),
+  workspaces: Schema.Array(Schema.String),
+});
+export type DesktopSbxSandbox = typeof DesktopSbxSandboxSchema.Type;
+
+export const DesktopSbxStatusSchema = Schema.Struct({
+  installed: Schema.Boolean,
+  version: Schema.NullOr(Schema.String),
+  // Installed and `sbx ls` succeeds (daemon reachable, login valid).
+  ready: Schema.Boolean,
+  // Output tail from the failed readiness probe; null when ready or not installed.
+  unreadyReason: Schema.NullOr(Schema.String),
+  // One-click installer usable on this host; "manual" shows copyable commands only.
+  installMethod: DesktopSbxInstallMethodSchema,
+  // Trusted install commands for this host platform, shown as copyable text.
+  manualInstallCommands: Schema.Array(Schema.String),
+  sandboxes: Schema.Array(DesktopSbxSandboxSchema),
+});
+export type DesktopSbxStatus = typeof DesktopSbxStatusSchema.Type;
+
+export const DesktopSbxCreateInputSchema = Schema.Struct({
+  name: Schema.String,
+  agent: Schema.String,
+  workspacePath: Schema.NullOr(Schema.String),
+  kits: Schema.Array(Schema.String),
+});
+export type DesktopSbxCreateInput = typeof DesktopSbxCreateInputSchema.Type;
+
+export const DesktopSbxRemoveInputSchema = Schema.Struct({
+  name: Schema.String,
+});
+
 export const PersistedSavedEnvironmentRecordSchema = Schema.Struct({
   environmentId: EnvironmentId,
   label: Schema.String,
@@ -1183,6 +1279,15 @@ export interface DesktopBridge {
   ) => Promise<AuthWebSocketTicketResult>;
   onSshPasswordPrompt: (listener: (request: DesktopSshPasswordPromptRequest) => void) => () => void;
   resolveSshPasswordPrompt: (requestId: string, password: string | null) => Promise<void>;
+  /**
+   * Docker Sandboxes (sbx) provisioning. Optional: older desktop builds lack
+   * them, and the web UI hides the Docker Sandbox flow when absent. A created
+   * sandbox is connected through the regular SSH environment methods above.
+   */
+  probeSbx?: () => Promise<DesktopSbxStatus>;
+  installSbx?: () => Promise<DesktopSbxStatus>;
+  createSbxSandbox?: (input: DesktopSbxCreateInput) => Promise<void>;
+  removeSbxSandbox?: (name: string) => Promise<void>;
   getServerExposureState: () => Promise<DesktopServerExposureState>;
   setServerExposureMode: (mode: DesktopServerExposureMode) => Promise<DesktopServerExposureState>;
   setTailscaleServeEnabled: (input: {
