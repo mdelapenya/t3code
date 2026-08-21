@@ -31,6 +31,12 @@ import {
   resolveSshPasswordPrompt,
 } from "./methods/sshEnvironment.ts";
 import {
+  createSbxSandbox,
+  installSbx,
+  probeSbx,
+  removeSbxSandbox,
+} from "./methods/sbxEnvironment.ts";
+import {
   checkForUpdate,
   downloadUpdate,
   getUpdateState,
@@ -133,6 +139,11 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(setServerExposureMode);
   yield* ipc.handle(setTailscaleServeEnabled);
   yield* ipc.handle(getAdvertisedEndpoints);
+
+  yield* ipc.handle(probeSbx);
+  yield* ipc.handle(installSbx);
+  yield* ipc.handle(createSbxSandbox);
+  yield* ipc.handle(removeSbxSandbox);
 
   yield* ipc.handle(getWslState);
   yield* ipc.handle(setWslBackendEnabled);
