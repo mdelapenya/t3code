@@ -1,8 +1,10 @@
 import {
   ChevronsLeftRightEllipsisIcon,
+  ContainerIcon,
   EllipsisIcon,
   PlusIcon,
   QrCodeIcon,
+  RefreshCwIcon,
   TerminalIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
@@ -33,8 +35,18 @@ import {
   type AuthEnvironmentScope,
   type AuthPairingLink,
   type AuthPairingCredentialResult,
+  SBX_DEFAULT_AGENT,
+  SBX_AGENTS,
+  SBX_OPTIONAL_KITS,
+  SBX_REQUIRED_KIT,
+  SBX_SSH_USERNAME,
+  sbxSandboxNameFromHostname,
+  sbxSshHostnameForSandbox,
+  validateSbxSandboxName,
   type AdvertisedEndpoint,
   type DesktopDiscoveredSshHost,
+  type DesktopSbxSandbox,
+  type DesktopSbxStatus,
   type DesktopSshEnvironmentTarget,
   type DesktopServerExposureState,
   type DesktopWslState,
@@ -155,6 +167,7 @@ import {
   desktopNetworkAccessStateAtom,
   refreshDesktopNetworkAccessState,
 } from "~/state/desktopNetworkAccess";
+import { desktopSbxStateAtom } from "~/state/desktopSbx";
 import { desktopSshHostsStateAtom, filterDiscoveredSshHosts } from "~/state/desktopSshHosts";
 import { desktopWslStateAtom, refreshDesktopWslState } from "~/state/desktopWslState";
 import {
@@ -411,6 +424,17 @@ function formatDesktopSshConnectionError(error: unknown): string {
     "",
   );
   const withoutTaggedErrorPrefix = withoutIpcPrefix.replace(/^Ssh[A-Za-z]+Error:\s*/u, "");
+  return withoutTaggedErrorPrefix.trim() || fallback;
+}
+
+function formatDesktopSbxError(error: unknown): string {
+  const fallback = "The sbx command failed.";
+  const rawMessage = error instanceof Error ? error.message : fallback;
+  const withoutIpcPrefix = rawMessage.replace(
+    /^Error invoking remote method 'desktop:[a-z-]+':\s*/u,
+    "",
+  );
+  const withoutTaggedErrorPrefix = withoutIpcPrefix.replace(/^DesktopSbx[A-Za-z]+Error:\s*/u, "");
   return withoutTaggedErrorPrefix.trim() || fallback;
 }
 
@@ -1648,6 +1672,390 @@ function SavedBackendListRow({
   );
 }
 
+interface SbxSandboxRowProps {
+  sandbox: DesktopSbxSandbox;
+  isConnecting: boolean;
+  disabled: boolean;
+  onConnect: (sandbox: DesktopSbxSandbox) => void;
+}
+
+const SbxSandboxRow = memo(function SbxSandboxRow({
+  sandbox,
+  isConnecting,
+  disabled,
+  onConnect,
+}: SbxSandboxRowProps) {
+  const metadataBits = [sandbox.agent, sandbox.status, sandbox.workspaces[0] ?? null].filter(
+    (value): value is string => value !== null,
+  );
+
+  return (
+    <div className="rounded-xl px-3 py-3 sm:px-4">
+      <div className={ITEM_ROW_INNER_CLASSNAME}>
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate text-sm font-medium text-foreground">{sandbox.name}</h3>
+          {metadataBits.length > 0 ? (
+            <p className="truncate text-xs text-muted-foreground">{metadataBits.join(" · ")}</p>
+          ) : null}
+        </div>
+        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+          <Button
+            size="xs"
+            variant="outline"
+            disabled={disabled || isConnecting}
+            onClick={() => onConnect(sandbox)}
+          >
+            {isConnecting ? <RefreshCwIcon className="size-3 animate-spin" /> : null}
+            {isConnecting ? "Adding…" : "Add environment"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+interface DockerSandboxModeBodyProps {
+  status: DesktopSbxStatus | null;
+  statusError: string | null;
+  isLoadingStatus: boolean;
+  refreshStatus: () => void;
+  isConnecting: boolean;
+  connectError: string | null;
+  savedAliasKeys: ReadonlySet<string>;
+  onConnect: (target: DesktopSshEnvironmentTarget) => Promise<void>;
+}
+
+// The Docker Sandbox flow only provisions: it installs the sbx CLI when
+// missing, creates the sandbox with the t3code kit, and then hands the
+// resulting <name>.sbx host to the exact same SSH connect path as a manually
+// typed host. Nothing after provisioning is sandbox-specific.
+function DockerSandboxModeBody({
+  status,
+  statusError,
+  isLoadingStatus,
+  refreshStatus,
+  isConnecting,
+  connectError,
+  savedAliasKeys,
+  onConnect,
+}: DockerSandboxModeBodyProps) {
+  const desktopBridge = window.desktopBridge;
+  const [sandboxName, setSandboxName] = useState("");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [agent, setAgent] = useState<string>(SBX_DEFAULT_AGENT);
+  const [enabledOptionalKits, setEnabledOptionalKits] = useState<ReadonlySet<string>>(
+    () => new Set(SBX_OPTIONAL_KITS.map((kit) => kit.reference)),
+  );
+  const [isInstalling, setIsInstalling] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const unsavedSandboxes = useMemo(
+    () =>
+      (status?.sandboxes ?? []).filter(
+        (sandbox) => !savedAliasKeys.has(sbxSshHostnameForSandbox(sandbox.name)),
+      ),
+    [savedAliasKeys, status?.sandboxes],
+  );
+
+  const handleInstall = useCallback(async () => {
+    if (!desktopBridge?.installSbx) return;
+    setIsInstalling(true);
+    setActionError(null);
+    try {
+      await desktopBridge.installSbx();
+      refreshStatus();
+    } catch (error) {
+      setActionError(formatDesktopSbxError(error));
+    } finally {
+      setIsInstalling(false);
+    }
+  }, [desktopBridge, refreshStatus]);
+
+  const connectSandbox = useCallback(
+    async (name: string) => {
+      const hostname = sbxSshHostnameForSandbox(name);
+      await onConnect({ alias: hostname, hostname, username: SBX_SSH_USERNAME, port: null });
+    },
+    [onConnect],
+  );
+
+  const handleCreate = useCallback(async () => {
+    if (!desktopBridge?.createSbxSandbox) return;
+    const name = sandboxName.trim();
+    const nameError = validateSbxSandboxName(name);
+    if (nameError !== null) {
+      setActionError(nameError);
+      return;
+    }
+    setIsCreating(true);
+    setActionError(null);
+    try {
+      await desktopBridge.createSbxSandbox({
+        name,
+        agent,
+        workspacePath: workspacePath.trim() || null,
+        kits: [
+          SBX_REQUIRED_KIT,
+          ...SBX_OPTIONAL_KITS.map((kit) => kit.reference).filter((reference) =>
+            enabledOptionalKits.has(reference),
+          ),
+        ],
+      });
+    } catch (error) {
+      setActionError(formatDesktopSbxError(error));
+      setIsCreating(false);
+      return;
+    }
+    refreshStatus();
+    await connectSandbox(name);
+    setIsCreating(false);
+    setSandboxName("");
+  }, [
+    agent,
+    connectSandbox,
+    desktopBridge,
+    enabledOptionalKits,
+    refreshStatus,
+    sandboxName,
+    workspacePath,
+  ]);
+
+  const handlePickWorkspace = useCallback(async () => {
+    if (!desktopBridge) return;
+    const picked = await desktopBridge.pickFolder();
+    if (picked !== null) {
+      setWorkspacePath(picked);
+    }
+  }, [desktopBridge]);
+
+  const renderManualInstallCommands = () =>
+    status && status.manualInstallCommands.length > 0 ? (
+      <pre className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-foreground">
+        {status.manualInstallCommands.join("\n")}
+      </pre>
+    ) : null;
+
+  const renderCheckAgain = () => (
+    <Button size="xs" variant="ghost" disabled={isLoadingStatus} onClick={refreshStatus}>
+      <RefreshCwIcon className={cn("size-3", isLoadingStatus && "animate-spin")} />
+      Check again
+    </Button>
+  );
+
+  if (status === null) {
+    if (statusError !== null) {
+      return (
+        <div className="space-y-3">
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {statusError}
+          </div>
+          {renderCheckAgain()}
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+        <Spinner className="size-3.5" />
+        Checking for the Docker Sandboxes CLI…
+      </div>
+    );
+  }
+
+  if (!status.installed) {
+    return (
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Docker Sandboxes run coding agents in isolated microVMs. The <code>sbx</code> CLI is not
+          installed on this machine yet.
+        </p>
+        {status.installMethod !== "manual" ? (
+          <Button
+            variant="outline"
+            className="w-full"
+            disabled={isInstalling}
+            onClick={() => void handleInstall()}
+          >
+            {isInstalling ? <Spinner className="size-3.5" /> : <PlusIcon className="size-3.5" />}
+            {isInstalling ? "Installing…" : "Install Docker Sandboxes"}
+          </Button>
+        ) : null}
+        <p className="text-[11px] text-muted-foreground">
+          {status.installMethod !== "manual"
+            ? "Or install it yourself:"
+            : "Install it from a terminal, then check again:"}
+        </p>
+        {renderManualInstallCommands()}
+        {actionError ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {actionError}
+          </div>
+        ) : null}
+        {renderCheckAgain()}
+      </div>
+    );
+  }
+
+  if (!status.ready) {
+    return (
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          The <code>sbx</code> CLI is installed{status.version ? ` (${status.version})` : ""} but
+          not ready. If you're not signed in yet, run <code>sbx login</code> in a terminal, then
+          check again.
+        </p>
+        {status.unreadyReason ? (
+          <pre className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            {status.unreadyReason}
+          </pre>
+        ) : null}
+        {renderCheckAgain()}
+      </div>
+    );
+  }
+
+  const displayedError = actionError ?? connectError;
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-3">
+        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_9rem]">
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-medium text-foreground">Sandbox name</span>
+            <Input
+              value={sandboxName}
+              onChange={(event) => setSandboxName(event.target.value)}
+              placeholder="my-project"
+              disabled={isCreating}
+              spellCheck={false}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-medium text-foreground">Agent image</span>
+            <Select
+              value={agent}
+              onValueChange={(value) => {
+                if (typeof value !== "string") return;
+                setAgent(value);
+              }}
+            >
+              <SelectTrigger className="w-full" aria-label="Agent image" disabled={isCreating}>
+                <SelectValue>{agent}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                {SBX_AGENTS.map((agentOption) => (
+                  <SelectItem hideIndicator key={agentOption} value={agentOption}>
+                    {agentOption}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          </label>
+        </div>
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium text-foreground">Workspace folder</span>
+          <div className="flex gap-2">
+            <Input
+              value={workspacePath}
+              onChange={(event) => setWorkspacePath(event.target.value)}
+              placeholder="Leave empty for no workspace mount"
+              disabled={isCreating}
+              spellCheck={false}
+            />
+            <Button
+              variant="outline"
+              disabled={isCreating}
+              onClick={() => void handlePickWorkspace()}
+            >
+              Browse…
+            </Button>
+          </div>
+        </label>
+        <div className="space-y-1.5">
+          <span className="block text-xs font-medium text-foreground">Kits</span>
+          <p className="text-[11px] text-muted-foreground">
+            The T3 Code kit is always included — it lets T3 Code connect to the sandbox without
+            compiling anything on first connect.
+          </p>
+          {SBX_OPTIONAL_KITS.map((kit) => (
+            <label key={kit.reference} className="flex items-start gap-2 text-xs text-foreground">
+              <Checkbox
+                checked={enabledOptionalKits.has(kit.reference)}
+                disabled={isCreating}
+                onCheckedChange={(checked) => {
+                  setEnabledOptionalKits((current) => {
+                    const next = new Set(current);
+                    if (checked) {
+                      next.add(kit.reference);
+                    } else {
+                      next.delete(kit.reference);
+                    }
+                    return next;
+                  });
+                }}
+              />
+              <span>
+                {kit.label}
+                <span className="block text-[11px] text-muted-foreground">{kit.description}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+        {displayedError ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {displayedError}
+          </div>
+        ) : null}
+        <Button
+          variant="outline"
+          className="w-full"
+          disabled={isCreating || isConnecting}
+          onClick={() => void handleCreate()}
+        >
+          {isCreating ? <Spinner className="size-3.5" /> : <PlusIcon className="size-3.5" />}
+          {isCreating
+            ? isConnecting
+              ? "Connecting…"
+              : "Creating sandbox…"
+            : "Create sandbox and connect"}
+        </Button>
+      </div>
+      <div className="overflow-hidden rounded-lg border border-border/60">
+        <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/30 px-3 py-2">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Existing sandboxes</p>
+            <p className="text-[11px] text-muted-foreground">From the sbx CLI on this machine</p>
+          </div>
+          <Button size="xs" variant="ghost" disabled={isLoadingStatus} onClick={refreshStatus}>
+            <RefreshCwIcon className={cn("size-3", isLoadingStatus && "animate-spin")} />
+            Refresh
+          </Button>
+        </div>
+        <ScrollArea scrollFade className="max-h-56">
+          <div>
+            {unsavedSandboxes.map((sandbox) => (
+              <SbxSandboxRow
+                key={sandbox.name}
+                sandbox={sandbox}
+                isConnecting={isConnecting}
+                disabled={isCreating}
+                onConnect={(target) => void connectSandbox(target.name)}
+              />
+            ))}
+            {unsavedSandboxes.length === 0 ? (
+              <div className={ITEM_ROW_CLASSNAME}>
+                <p className="text-xs text-muted-foreground">
+                  No sandboxes yet — create one above.
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </ScrollArea>
+      </div>
+    </div>
+  );
+}
+
 function CloudLinkSwitch({
   checked,
   disabled,
@@ -1949,7 +2357,7 @@ export function ConnectionsSettings() {
   >(null);
   const [isRevokingOtherDesktopClients, setIsRevokingOtherDesktopClients] = useState(false);
   const [addBackendDialogOpen, setAddBackendDialogOpen] = useState(false);
-  const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh">("remote");
+  const [savedBackendMode, setSavedBackendMode] = useState<"remote" | "ssh" | "sbx">("remote");
   const [savedBackendHost, setSavedBackendHost] = useState("");
   const [savedBackendPairingCode, setSavedBackendPairingCode] = useState("");
   const [savedBackendSshHost, setSavedBackendSshHost] = useState("");
@@ -1962,6 +2370,13 @@ export function ConnectionsSettings() {
   const [isAddingSavedBackend, setIsAddingSavedBackend] = useState(false);
   const [removingSavedEnvironmentId, setRemovingSavedEnvironmentId] =
     useState<EnvironmentId | null>(null);
+  // Set when removal targets an environment backed by a Docker sandbox, so
+  // the user can choose whether the sandbox itself goes too.
+  const [pendingSbxRemoval, setPendingSbxRemoval] = useState<{
+    readonly environmentId: EnvironmentId;
+    readonly label: string;
+    readonly sandboxName: string;
+  } | null>(null);
   const [isUpdatingDesktopServerExposure, setIsUpdatingDesktopServerExposure] = useState(false);
   const [isDesktopServerExposureDialogOpen, setIsDesktopServerExposureDialogOpen] = useState(false);
   const [isUpdatingTailscaleServe, setIsUpdatingTailscaleServe] = useState(false);
@@ -2036,6 +2451,12 @@ export function ConnectionsSettings() {
   useEffect(() => {
     if (isSshDiscoveryActive) refreshDesktopSshHosts();
   }, [isSshDiscoveryActive, refreshDesktopSshHosts]);
+  const desktopSbxAvailable = typeof desktopBridge?.probeSbx === "function";
+  const desktopSbx = useEnvironmentQuery(
+    desktopSbxAvailable && addBackendDialogOpen && savedBackendMode === "sbx"
+      ? desktopSbxStateAtom
+      : null,
+  );
   const desktopWsl = useEnvironmentQuery(
     canManageLocalBackend && desktopBridge ? desktopWslStateAtom : null,
   );
@@ -2506,19 +2927,8 @@ export function ConnectionsSettings() {
     [setEnvironmentEnabled],
   );
 
-  // Removing forgets the pairing, credentials, and cached threads on this
-  // device. Switching off is the reversible path, so removal always confirms.
-  const handleRemoveSavedBackend = useCallback(
-    async (environment: EnvironmentPresentation) => {
-      // Fail closed: no mounted confirm host means no removal.
-      const confirmed = await requestConfirmDialog(
-        `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
-        { variant: "destructive" },
-      );
-      if (confirmed !== true) {
-        return;
-      }
-      const environmentId = environment.environmentId;
+  const performRemoveSavedBackend = useCallback(
+    async (environmentId: EnvironmentId) => {
       setRemovingSavedEnvironmentId(environmentId);
       setSavedBackendError(null);
       const result = await removeEnvironment(environmentId);
@@ -2534,9 +2944,74 @@ export function ConnectionsSettings() {
             description: message,
           }),
         );
+        return false;
       }
+      return true;
     },
     [removeEnvironment],
+  );
+
+  // Removing forgets the pairing, credentials, and cached threads on this
+  // device. Switching off is the reversible path, so removal always confirms.
+  // Environments backed by a Docker sandbox (host <name>.sbx) confirm through
+  // their own dialog rather than stacking a second one: it repeats that
+  // warning and adds the choice of deleting the sandbox, so the reverse of
+  // "create and connect" is one flow instead of an orphaned VM.
+  const handleRemoveSavedBackend = useCallback(
+    async (environment: EnvironmentPresentation) => {
+      const profile = environment.entry.profile;
+      const sandboxName =
+        desktopBridge?.removeSbxSandbox !== undefined &&
+        Option.isSome(profile) &&
+        profile.value._tag === "SshConnectionProfile"
+          ? sbxSandboxNameFromHostname(profile.value.target.hostname)
+          : null;
+      if (sandboxName !== null) {
+        setPendingSbxRemoval({
+          environmentId: environment.environmentId,
+          label: environment.label,
+          sandboxName,
+        });
+        return;
+      }
+      // Fail closed: no mounted confirm host means no removal.
+      const confirmed = await requestConfirmDialog(
+        `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
+        { variant: "destructive" },
+      );
+      if (confirmed !== true) {
+        return;
+      }
+      await performRemoveSavedBackend(environment.environmentId);
+    },
+    [desktopBridge, performRemoveSavedBackend],
+  );
+
+  const handleConfirmSbxRemoval = useCallback(
+    async (removeSandbox: boolean) => {
+      const pending = pendingSbxRemoval;
+      if (pending === null) return;
+      setPendingSbxRemoval(null);
+      const removed = await performRemoveSavedBackend(pending.environmentId);
+      if (!removed || !removeSandbox) return;
+      try {
+        await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
+        toastManager.add({
+          type: "success",
+          title: "Sandbox removed",
+          description: `Docker sandbox “${pending.sandboxName}” was deleted.`,
+        });
+      } catch (error) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not remove sandbox",
+            description: formatDesktopSbxError(error),
+          }),
+        );
+      }
+    },
+    [pendingSbxRemoval, performRemoveSavedBackend],
   );
 
   const visibleDesktopPairingLinks = desktopPairingLinks;
@@ -2594,7 +3069,7 @@ export function ConnectionsSettings() {
   }, []);
 
   const renderConnectionModeCard = (input: {
-    readonly mode: "remote" | "ssh";
+    readonly mode: "remote" | "ssh" | "sbx";
     readonly title: string;
     readonly description: string;
     readonly icon?: ReactNode;
@@ -3729,9 +4204,33 @@ export function ConnectionsSettings() {
                             icon: <TerminalIcon aria-hidden className="size-4" />,
                           })
                         : null}
+                      {desktopSbxAvailable
+                        ? renderConnectionModeCard({
+                            mode: "sbx",
+                            title: "Docker Sandbox",
+                            description:
+                              "Create an isolated microVM with the sbx CLI and connect over SSH.",
+                            icon: <ContainerIcon aria-hidden className="size-4" />,
+                          })
+                        : null}
                     </div>
                     <AnimatedHeight>
-                      {savedBackendMode === "ssh" ? renderSshFields() : renderRemoteModeBody()}
+                      {savedBackendMode === "ssh" ? (
+                        renderSshFields()
+                      ) : savedBackendMode === "sbx" ? (
+                        <DockerSandboxModeBody
+                          status={desktopSbx.data}
+                          statusError={desktopSbx.error}
+                          isLoadingStatus={desktopSbx.isPending}
+                          refreshStatus={desktopSbx.refresh}
+                          isConnecting={isAddingSavedBackend}
+                          connectError={savedBackendError}
+                          savedAliasKeys={savedDesktopSshEnvironmentKeys}
+                          onConnect={connectSavedBackendSshTarget}
+                        />
+                      ) : (
+                        renderRemoteModeBody()
+                      )}
                     </AnimatedHeight>
                   </div>
                 </DialogPanel>
@@ -3756,6 +4255,35 @@ export function ConnectionsSettings() {
       </SettingsSection>
       <LoadBalancingSettings environments={loadBalancingEnvironments} />
       <GitHubRoutingSettings environments={loadBalancingEnvironments} />
+      <AlertDialog
+        open={pendingSbxRemoval !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingSbxRemoval(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove Docker sandbox too?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Removing {pendingSbxRemoval?.label} from this device forgets its pairing, credentials,
+              and cached threads here. It runs inside the Docker sandbox “
+              {pendingSbxRemoval?.sandboxName}”, which you can keep running or delete along with
+              everything in it. Deleting the sandbox cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>
+              <span className="[text-box:trim-both_cap_alphabetic]">Cancel</span>
+            </AlertDialogClose>
+            <Button variant="default" onClick={() => void handleConfirmSbxRemoval(false)}>
+              <span className="[text-box:trim-both_cap_alphabetic]">Keep sandbox</span>
+            </Button>
+            <Button variant="destructive" onClick={() => void handleConfirmSbxRemoval(true)}>
+              <span className="[text-box:trim-both_cap_alphabetic]">Delete sandbox</span>
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </SettingsPageContainer>
   );
 }
