@@ -182,6 +182,37 @@ running is left alone.
 For Antigravity's Google callback on a remote host, see
 [remote sign-in](./providers-antigravity.md#sign-in-from-a-remote-device).
 
+## Docker Sandboxes
+
+Use a Docker Sandbox when you want agents working inside an isolated microVM
+on your own machine instead of directly on your files. T3 Code creates the
+sandbox with Docker's `sbx` CLI and connects to it over SSH like any other
+remote host.
+
+In the desktop app, open **Settings → Connections → Add environment** and
+choose **Docker Sandbox**. If the `sbx` CLI is missing, install it from the
+same screen: one click on Windows (winget) and on macOS with Homebrew, or copy
+the shown commands on Linux and anywhere else. If you have never signed in, run
+`sbx login` in a terminal and choose **Check again**. Then name the sandbox,
+optionally pick a workspace folder for it to mount, and create it. Sandboxes
+you already made with the CLI are listed under **Existing sandboxes** and can be
+added the same way.
+
+T3 Code always applies the T3 Code kit when creating a sandbox. It preinstalls
+what the SSH launch needs, so the first connection does not compile anything or
+depend on registry access. Two optional kits, GitHub host keys and SSH commit
+signing, are on by default and can be unchecked.
+
+The sandbox appears as an SSH environment at `<name>.sbx`, and everything from
+the section above applies, including reconnects and server updates. Removing it
+from **Settings → Connections** asks whether to keep the sandbox running for
+later or delete it along with everything inside. Deleting cannot be undone.
+
+Docker Sandboxes has its own platform requirements (Apple silicon macOS 14+,
+Windows 11, or Ubuntu 24.04+ with KVM). See the
+[Docker Sandboxes documentation](https://docs.docker.com/ai/sandboxes/) for
+details.
+
 ## Browser on a remote environment
 
 Browser tabs belong to the environment, so you and your agents see the same
