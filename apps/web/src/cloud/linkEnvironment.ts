@@ -20,8 +20,12 @@ import {
   type RelayManagedEndpointProviderKind,
 } from "@t3tools/contracts/relay";
 import { EnvironmentRegistry } from "@t3tools/client-runtime/connection";
-import { request, runStream } from "@t3tools/client-runtime/rpc";
-import { makeEnvironmentHttpApiClient } from "@t3tools/client-runtime/rpc";
+import {
+  makeEnvironmentHttpApiClient,
+  remoteHttpClientLayer,
+  request,
+  runStream,
+} from "@t3tools/client-runtime/rpc";
 import { ManagedRelay, relayProtectedErrorMessage } from "@t3tools/client-runtime/relay";
 
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
@@ -345,4 +349,116 @@ export function linkPrimaryEnvironmentToCloud(input: {
       })
       .pipe(Effect.mapError(environmentApiError("Could not configure environment relay access.")));
   }).pipe(Effect.provide(primaryEnvironmentHttpLayer));
+}
+
+/**
+ * Links a Docker Sandbox environment to T3 Connect with a managed Cloudflare
+ * tunnel so that mobile and remote clients can reach the sandbox agent.
+ *
+ * Differences from `linkPrimaryEnvironmentToCloud`:
+ * - Auth against the sandbox T3 server uses the SSH provisioning bearer token
+ *   passed in `bearerToken`, not the primary desktop session.
+ * - The `ensureRelayClientAvailable` step is skipped; the sandbox kit is
+ *   expected to pre-install cloudflared. A missing relay client surfaces as an
+ *   error the caller can handle (e.g. log a warning, let the user retry via UI).
+ * - Always uses `managed` mode — the point is a Cloudflare tunnel so mobile
+ *   clients can reach the sandbox from outside the desktop host.
+ * - Uses a plain fetch HTTP layer (no desktop bearer middleware) since auth is
+ *   embedded in the `authorization` header per request.
+ */
+export function linkSandboxEnvironmentToCloud(input: {
+  readonly target: CloudLinkTarget;
+  readonly clerkToken: string;
+  /**
+   * Bearer token from `SshRegistrationResult.bearerToken`. Passed as the
+   * `Authorization` header on HTTP calls to the sandbox T3 server because the
+   * sandbox has its own auth context separate from the primary environment.
+   */
+  readonly bearerToken: string;
+}): Effect.Effect<
+  void,
+  CloudEnvironmentLinkError,
+  HttpClient.HttpClient | ManagedRelay.ManagedRelayClient
+> {
+  return Effect.gen(function* () {
+    const configuredRelayUrl = relayUrl();
+    if (!configuredRelayUrl) {
+      return yield* new CloudEnvironmentLinkError({
+        message: "T3CODE_RELAY_URL is not configured.",
+      });
+    }
+
+    const relayClient = yield* ManagedRelay.ManagedRelayClient;
+    const environmentClient = yield* makeEnvironmentHttpApiClient(input.target.httpBaseUrl);
+    const bearerHeader = `Bearer ${input.bearerToken}`;
+
+    const challenge = yield* relayClient
+      .createEnvironmentLinkChallenge({
+        clerkToken: input.clerkToken,
+        payload: {
+          notificationsEnabled: true,
+          liveActivitiesEnabled: true,
+          managedTunnelsEnabled: true,
+        },
+      })
+      .pipe(
+        Effect.mapError(
+          decodedRelayClientError(
+            `${configuredRelayUrl}/v1/client/environment-link-challenges failed`,
+          ),
+        ),
+      );
+
+    const proof = yield* environmentClient.connect
+      .linkProof({
+        headers: { authorization: bearerHeader },
+        payload: {
+          challenge: challenge.challenge,
+          relayIssuer: configuredRelayUrl,
+          endpoint: {
+            httpBaseUrl: input.target.httpBaseUrl,
+            wsBaseUrl: input.target.wsBaseUrl,
+            providerKind: MANAGED_ENDPOINT_PROVIDER_KIND,
+          },
+          origin: endpointOrigin(input.target.httpBaseUrl),
+        },
+      })
+      .pipe(Effect.mapError(environmentApiError("Could not obtain sandbox link proof.")));
+
+    const link = yield* relayClient
+      .linkEnvironment({
+        clerkToken: input.clerkToken,
+        payload: {
+          proof,
+          notificationsEnabled: true,
+          liveActivitiesEnabled: true,
+          managedTunnelsEnabled: true,
+        },
+      })
+      .pipe(
+        Effect.mapError(
+          decodedRelayClientError(`${configuredRelayUrl}/v1/client/environment-links failed`),
+        ),
+      );
+
+    yield* ensureLinkedEnvironmentMatches({
+      expectedEnvironmentId: input.target.environmentId,
+      expectedProviderKind: MANAGED_ENDPOINT_PROVIDER_KIND,
+      link,
+    });
+
+    yield* environmentClient.connect
+      .relayConfig({
+        headers: { authorization: bearerHeader },
+        payload: {
+          relayUrl: configuredRelayUrl,
+          relayIssuer: link.relayIssuer,
+          cloudUserId: link.cloudUserId,
+          environmentCredential: link.environmentCredential,
+          cloudMintPublicKey: link.cloudMintPublicKey,
+          endpointRuntime: link.endpointRuntime,
+        },
+      })
+      .pipe(Effect.mapError(environmentApiError("Could not configure sandbox relay access.")));
+  }).pipe(Effect.provide(remoteHttpClientLayer(globalThis.fetch)));
 }

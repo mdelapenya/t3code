@@ -50,6 +50,31 @@ export interface BearerConnectionUpdateInput {
   readonly httpBaseUrl: string;
 }
 
+/**
+ * Value returned by a successful SSH environment registration. Carries the
+ * provisioned HTTP endpoint details so callers can make authenticated API calls
+ * to the remote environment right after registration — e.g. to activate T3
+ * Connect relay — without re-establishing the SSH tunnel.
+ */
+export interface SshRegistrationResult {
+  /** The environment ID returned by the remote T3 server. */
+  readonly environmentId: EnvironmentId;
+  /**
+   * Local HTTP base URL of the SSH-forwarded T3 server, e.g.
+   * `http://127.0.0.1:<localPort>`. Valid for the lifetime of the active SSH
+   * tunnel established during provisioning.
+   */
+  readonly httpBaseUrl: string;
+  /** WebSocket base URL derived from `httpBaseUrl`. */
+  readonly wsBaseUrl: string;
+  /**
+   * Short-lived bearer token that authorises requests to the sandbox T3
+   * server's HTTP API. Pass as `Authorization: Bearer <bearerToken>` when
+   * calling `httpBaseUrl` outside the primary HTTP client layer.
+   */
+  readonly bearerToken: string;
+}
+
 export class ConnectionOnboarding extends Context.Service<
   ConnectionOnboarding,
   {
@@ -62,7 +87,7 @@ export class ConnectionOnboarding extends Context.Service<
     readonly registerSsh: (
       input: SshConnectionInput,
     ) => Effect.Effect<
-      EnvironmentId,
+      SshRegistrationResult,
       ConnectionAttemptError | Persistence.ConnectionPersistenceError
     >;
     readonly updateBearer: (
@@ -221,7 +246,7 @@ export const prepareSshRegistration = Effect.fn(
   const connectionId = `ssh:${provisioned.environmentId}`;
   const label = input.label?.trim() || provisioned.label || provisioned.bootstrap.target.alias;
 
-  return new SshConnectionRegistration({
+  const registration = new SshConnectionRegistration({
     target: new SshConnectionTarget({
       environmentId: provisioned.environmentId,
       label,
@@ -234,15 +259,28 @@ export const prepareSshRegistration = Effect.fn(
       target: provisioned.bootstrap.target,
     }),
   });
+
+  return {
+    registration,
+    httpBaseUrl: provisioned.bootstrap.httpBaseUrl,
+    wsBaseUrl: provisioned.bootstrap.wsBaseUrl,
+    bearerToken: provisioned.bearerToken,
+  };
 });
 
 const registerSshConnection = Effect.fn(
   "clientRuntime.connection.onboarding.registerSshConnection",
 )(function* (input: SshConnectionInput) {
-  const registration = yield* prepareSshRegistration(input);
+  const { registration, httpBaseUrl, wsBaseUrl, bearerToken } =
+    yield* prepareSshRegistration(input);
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
   yield* registry.register(registration);
-  return registration.target.environmentId;
+  return {
+    environmentId: registration.target.environmentId,
+    httpBaseUrl,
+    wsBaseUrl,
+    bearerToken,
+  } satisfies SshRegistrationResult;
 });
 
 /** @public Service construction is part of the canonical Effect module API. */

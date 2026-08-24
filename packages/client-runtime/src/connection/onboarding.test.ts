@@ -242,7 +242,7 @@ describe("connection onboarding", () => {
         username: "developer",
         port: 22,
       };
-      const registration = yield* prepareSshRegistration({
+      const { registration } = yield* prepareSshRegistration({
         target,
       }).pipe(
         Effect.provideService(
