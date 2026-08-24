@@ -605,7 +605,7 @@ describe("connection onboarding", () => {
         username: "developer",
         port: 22,
       };
-      const { registration } = yield* prepareSshRegistration({
+      const result = yield* prepareSshRegistration({
         target,
       }).pipe(
         Effect.provideService(
@@ -629,7 +629,7 @@ describe("connection onboarding", () => {
         ),
       );
 
-      expect(registration).toMatchObject({
+      expect(result.registration).toMatchObject({
         _tag: "SshConnectionRegistration",
         target: {
           environmentId: "environment-ssh",
@@ -643,6 +643,9 @@ describe("connection onboarding", () => {
           target,
         },
       });
+      expect(result.httpBaseUrl).toBe("http://127.0.0.1:3201");
+      expect(result.wsBaseUrl).toBe("ws://127.0.0.1:3201");
+      expect(result.bearerToken).toBe("bearer-token");
     }),
   );
 });
