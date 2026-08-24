@@ -7,6 +7,8 @@ export * from "./githubRoutingPermissions.ts";
 export * as Connection from "./layer.ts";
 export * from "./model.ts";
 export * as ConnectionOnboarding from "./onboarding.ts";
+// Flat so callers can annotate an SSH registration result without the namespace.
+export { type SshRegistrationResult } from "./onboarding.ts";
 export * from "./presentation.ts";
 export * as ProfileStore from "./profileStore.ts";
 export * from "./routes.ts";

@@ -170,12 +170,14 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
-import { hasCloudPublicConfig } from "~/cloud/publicConfig";
+import { useAuth } from "@clerk/react";
+import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "~/cloud/publicConfig";
 import { RemoveT3ConnectEnvironmentDialog } from "../clerk/RemoveT3ConnectEnvironmentDialog";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
 import { environmentCatalog } from "~/connection/catalog";
 import {
+  connectAndLinkSandboxEnvironment as connectAndLinkSandboxEnvironmentAtom,
   connectPairing as connectPairingAtom,
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
@@ -2459,6 +2461,10 @@ export function ConnectionsSettings() {
   const connectSshEnvironment = useAtomCommand(connectSshEnvironmentAtom, {
     reportFailure: false,
   });
+  const connectAndLinkSandboxEnvironment = useAtomCommand(connectAndLinkSandboxEnvironmentAtom, {
+    reportFailure: false,
+  });
+  const { getToken: getClerkToken } = useAuth();
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
   const registerEnvironment = useAtomCommand(environmentCatalog.register, {
     reportFailure: false,
@@ -3306,6 +3312,40 @@ export function ConnectionsSettings() {
       }
     },
     [pendingSbxRemoval, removeSavedBackend],
+  );
+
+  // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it
+  // also attempts T3 Connect relay activation so mobile and remote clients can
+  // reach the sandbox agent without being on this desktop host. Relay failure is
+  // non-fatal inside the command, so a success here may still be SSH-only.
+  const connectSandboxSshTarget = useCallback(
+    async (target: DesktopSshEnvironmentTarget) => {
+      setIsAddingSavedBackend(true);
+      setSavedBackendError(null);
+      const clerkToken = await getClerkToken(resolveRelayClerkTokenOptions()).catch(() => null);
+      const result = await connectAndLinkSandboxEnvironment({ target, label: "", clerkToken });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          setSavedBackendError(formatDesktopSshConnectionError(squashAtomCommandFailure(result)));
+        }
+        setIsAddingSavedBackend(false);
+        return;
+      }
+
+      setSavedBackendHost("");
+      setSavedBackendPairingCode("");
+      setSavedBackendSshHost("");
+      setSavedBackendSshUsername("");
+      setSavedBackendSshPort("");
+      setAddBackendDialogOpen(false);
+      toastManager.add({
+        type: "success",
+        title: "Sandbox connected",
+        description: `${target.alias} is ready${clerkToken ? " with T3 Connect relay" : " over SSH"}.`,
+      });
+      setIsAddingSavedBackend(false);
+    },
+    [connectAndLinkSandboxEnvironment, getClerkToken],
   );
 
   const visibleDesktopPairingLinks = desktopPairingLinks;
@@ -4631,7 +4671,7 @@ export function ConnectionsSettings() {
                           isConnecting={isAddingSavedBackend}
                           connectError={savedBackendError}
                           savedAliasKeys={savedDesktopSshEnvironmentKeys}
-                          onConnect={connectSavedBackendSshTarget}
+                          onConnect={connectSandboxSshTarget}
                         />
                       ) : (
                         renderRemoteModeBody()
