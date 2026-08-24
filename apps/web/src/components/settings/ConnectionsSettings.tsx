@@ -7,6 +7,7 @@ import {
   RefreshCwIcon,
   TerminalIcon,
 } from "lucide-react";
+import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import { Atom } from "effect/unstable/reactivity";
 import {
@@ -154,7 +155,6 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
-import { useAuth } from "@clerk/react";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "~/cloud/publicConfig";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
