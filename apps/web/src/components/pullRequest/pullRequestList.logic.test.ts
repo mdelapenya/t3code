@@ -246,6 +246,12 @@ describe("narrowing rows by the filters a host may not have applied", () => {
     expect(narrow({ review: "none" })).toEqual([1, 2]);
   });
 
+  it("narrows to not-approved only where the row said what its review state is", () => {
+    // Rows 1 and 2 carry no decision — their host may not summarise reviews at all, and the
+    // server left them unnarrowed rather than guessing, so this pass does not claim them either.
+    expect(narrow({ review: "not-approved" })).toEqual([4]);
+  });
+
   it("matches labels and authors however either was capitalized", () => {
     expect(narrow({ labels: [["needs DESIGN"]] })).toEqual([4]);
     expect(narrow({ excludedLabels: ["needs design"] })).toEqual([1, 2, 3]);
@@ -349,6 +355,11 @@ describe("reading qualifiers out of a typed query", () => {
       review: "changes-requested",
       checks: "failing",
     });
+  });
+
+  it("reads the board's own review value, however it was spelled", () => {
+    expect(parsePullRequestQuery("review:not-approved").filters.review).toBe("not-approved");
+    expect(parsePullRequestQuery("review:unapproved").filters.review).toBe("not-approved");
   });
 
   it("leaves an unknown value and a stray colon as text, and reads an unknown key as a label", () => {
@@ -765,6 +776,23 @@ describe("merging the environments' own listings", () => {
     expect(merged?.nextCursors).toEqual({
       [ENV_1]: { "github.com pingdotgg/t3code": "cursor-1" },
     });
+  });
+
+  it("sums the environments' totals when every one of them reported theirs", () => {
+    const merged = mergePullRequestLists([
+      [ENV_1, answer({ totalCount: 12 })],
+      [ENV_2, answer({ totalCount: 30 })],
+    ]);
+    expect(merged?.totalCount).toBe(42);
+  });
+
+  it("has no total at all when one environment could not say", () => {
+    const merged = mergePullRequestLists([
+      [ENV_1, answer({ totalCount: 12 })],
+      [ENV_2, answer()],
+    ]);
+    expect(merged?.totalCount).toBeUndefined();
+    expect("totalCount" in merged!).toBe(false);
   });
 
   it("reads the same key whichever order the environments connected in", () => {

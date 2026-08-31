@@ -14,6 +14,7 @@ import type {
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   ChevronDownIcon,
+  Columns3Icon,
   EyeIcon,
   MonitorIcon,
   ServerIcon,
@@ -24,6 +25,7 @@ import {
   PenLineIcon,
   LoaderIcon,
   RefreshCwIcon,
+  Rows3Icon,
   SearchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -54,6 +56,8 @@ import {
   type PullRequestDiffStats,
   type PullRequestPartitionsSnapshot,
 } from "../components/pullRequest/pullRequestList.logic";
+import { pullRequestBoardScopeKey } from "../components/pullRequest/pullRequestBoard.logic";
+import { PullRequestBoardView } from "../components/pullRequest/PullRequestBoardView";
 import { assignProjectsToEnvironments } from "../components/pullRequest/pullRequestProjectAssignment.logic";
 import { PullRequestDetailPanel } from "../components/pullRequest/PullRequestDetailPanel";
 import {
@@ -94,12 +98,14 @@ import {
 import { useDebouncedValue } from "../state/queries";
 import { useAllEnvironmentShellsBootstrapped, useProjects } from "../state/entities";
 import { useEnvironments } from "../state/environments";
+import type { PullRequestBoardColumnScope } from "../state/pullRequestBoard";
 import {
   pullRequestEnvironment,
   usePullRequestList,
   usePullRequestListStats,
   type EnvironmentQueryTarget,
 } from "../state/pullRequests";
+import { Toggle, ToggleGroup } from "../components/ui/toggle-group";
 import { useAtomCommand } from "../state/use-atom-command";
 import { cn } from "~/lib/utils";
 import { getSourceControlPresentationForKind } from "~/sourceControlPresentation";
@@ -107,6 +113,11 @@ import { getSourceControlPresentationForKind } from "~/sourceControlPresentation
 export interface PullRequestsSearch {
   readonly involvement: PullRequestInvolvement;
   readonly state: PullRequestListState;
+  /**
+   * The board, laid out by review stage, instead of the flat list. Absent is the list, so every
+   * link written before the board existed still opens the page it was written against.
+   */
+  readonly view?: "board";
   /**
    * Narrows the list to one server. Absent means every connected one, which is the default the
    * page has now — so a link written before servers could be chosen still opens the whole list.
@@ -188,6 +199,7 @@ export const Route = createFileRoute("/_chat/pull-requests")({
       raw.involvement === "reviewing" || raw.involvement === "authored" ? raw.involvement : "all",
     state:
       raw.state === "closed" || raw.state === "merged" || raw.state === "all" ? raw.state : "open",
+    ...(raw.view === "board" ? { view: "board" as const } : {}),
     ...(typeof raw.repository === "string" && raw.repository
       ? { repository: raw.repository.slice(0, 200) }
       : {}),
@@ -212,6 +224,7 @@ export const Route = createFileRoute("/_chat/pull-requests")({
     ...(raw.review === "approved" ||
     raw.review === "changes-requested" ||
     raw.review === "review-required" ||
+    raw.review === "not-approved" ||
     raw.review === "none"
       ? { review: raw.review }
       : {}),
@@ -223,6 +236,10 @@ export const Route = createFileRoute("/_chat/pull-requests")({
 function PullRequestsRouteView() {
   const search = Route.useSearch();
   const navigate = useNavigate({ from: Route.fullPath });
+  // The board reads its four columns itself, so every read the flat list owns — the feed, its
+  // baseline, the two priority partitions and the line counts keyed off them — is asked for
+  // nothing while it is showing.
+  const boardView = search.view === "board";
   const { environments } = useEnvironments();
   // Every connected environment that has said it can list pull requests. Sorted, so the query
   // keys, the scope key and the stored snapshot all read the same whichever order the
@@ -416,6 +433,7 @@ function PullRequestsRouteView() {
           return {
             involvement: next.involvement ?? previous.involvement,
             state: next.state ?? previous.state,
+            ...(next.view ? { view: next.view } : {}),
             ...(next.repository ? { repository: next.repository } : {}),
             ...(next.number ? { number: next.number } : {}),
             ...(next.projectId ? { projectId: next.projectId } : {}),
@@ -550,6 +568,26 @@ function PullRequestsRouteView() {
   // Page size is view state, not a URL concern: a shared link should open the first page.
   const scopeKey = `${environmentKey}:${assignmentKey}:${search.state}:${search.involvement}:${scopedProjectId ?? ""}:${search.host ?? ""}:${search.draft ?? ""}:${search.review ?? ""}:${search.checks ?? ""}`;
   const filterKey = `${scopeKey}:${sentQuery}`;
+  /**
+   * What every board column asks within. State, draft and review are the columns' own, so they
+   * are the one part of the list's scope the board does not carry.
+   */
+  const boardScope = useMemo(
+    (): PullRequestBoardColumnScope => ({
+      involvement: search.involvement,
+      ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+      ...(search.host ? { host: search.host } : {}),
+      ...(sentParsed.text ? { query: sentParsed.text } : {}),
+    }),
+    [scopedProjectId, search.host, search.involvement, sentParsed.text],
+  );
+  const boardScopeKey = pullRequestBoardScopeKey({
+    environmentKey: `${environmentKey}:${assignmentKey}`,
+    involvement: search.involvement,
+    ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+    ...(search.host ? { host: search.host } : {}),
+    ...(sentQuery ? { query: sentQuery } : {}),
+  });
   // Where the next slice carries on from, per repository within each environment, as that
   // environment handed it back. Sending it is what makes a second page cost a second page rather
   // than the whole list again — and a repository it does not name has run out and is not read a
@@ -580,36 +618,43 @@ function PullRequestsRouteView() {
   /** The listing input each environment is asked for, which differs only in its continuation. */
   const listTargets = useMemo(
     () =>
-      environmentQueries.flatMap(({ environmentId, projectIds }) => {
-        const cursors = sentCursors?.[environmentId];
-        // A continuation asks the environments that said where to carry on from, plus the ones
-        // that have more to give but no cursor to give it from — those are read again at the
-        // larger page. The rest have run out, and re-reading them would answer with the page
-        // that is already on screen.
-        if (sentCursors !== null && cursors === undefined && !sentRegrown.includes(environmentId)) {
-          return [];
-        }
-        return [
-          {
-            environmentId,
-            input: {
-              state: search.state,
-              // The hosts narrow by involvement themselves — GitHub by author and review
-              // request, and so on — so asking them is the difference between a page of results
-              // and a page of everything with the answer somewhere further down it.
-              involvement: search.involvement,
-              limit: pageSize,
-              ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
-              ...(projectIds ? { projectIds } : {}),
-              ...(search.host ? { host: search.host } : {}),
-              ...(hasFilters ? { filters } : {}),
-              ...(sentParsed.text ? { query: sentParsed.text } : {}),
-              ...(cursors === undefined ? {} : { cursors }),
-            } satisfies PullRequestListInput,
-          },
-        ];
-      }),
+      boardView
+        ? NO_LIST_TARGETS
+        : environmentQueries.flatMap(({ environmentId, projectIds }) => {
+            const cursors = sentCursors?.[environmentId];
+            // A continuation asks the environments that said where to carry on from, plus the
+            // ones that have more to give but no cursor to give it from — those are read again
+            // at the larger page. The rest have run out, and re-reading them would answer with
+            // the page that is already on screen.
+            if (
+              sentCursors !== null &&
+              cursors === undefined &&
+              !sentRegrown.includes(environmentId)
+            ) {
+              return [];
+            }
+            return [
+              {
+                environmentId,
+                input: {
+                  state: search.state,
+                  // The hosts narrow by involvement themselves — GitHub by author and review
+                  // request, and so on — so asking them is the difference between a page of
+                  // results and a page of everything with the answer further down it.
+                  involvement: search.involvement,
+                  limit: pageSize,
+                  ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+                  ...(projectIds ? { projectIds } : {}),
+                  ...(search.host ? { host: search.host } : {}),
+                  ...(hasFilters ? { filters } : {}),
+                  ...(sentParsed.text ? { query: sentParsed.text } : {}),
+                  ...(cursors === undefined ? {} : { cursors }),
+                } satisfies PullRequestListInput,
+              },
+            ];
+          }),
     [
+      boardView,
       filters,
       hasFilters,
       pageSize,
@@ -637,19 +682,22 @@ function PullRequestsRouteView() {
    */
   const baselineTargets = useMemo(
     () =>
-      environmentQueries.map(({ environmentId, projectIds }) => ({
-        environmentId,
-        input: {
-          state: search.state,
-          involvement: search.involvement,
-          limit: PAGE_SIZE,
-          ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
-          ...(projectIds ? { projectIds } : {}),
-          ...(search.host ? { host: search.host } : {}),
-          ...(menuFiltered ? { filters: menuFilters } : {}),
-        } satisfies PullRequestListInput,
-      })),
+      boardView
+        ? NO_LIST_TARGETS
+        : environmentQueries.map(({ environmentId, projectIds }) => ({
+            environmentId,
+            input: {
+              state: search.state,
+              involvement: search.involvement,
+              limit: PAGE_SIZE,
+              ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+              ...(projectIds ? { projectIds } : {}),
+              ...(search.host ? { host: search.host } : {}),
+              ...(menuFiltered ? { filters: menuFilters } : {}),
+            } satisfies PullRequestListInput,
+          })),
     [
+      boardView,
       menuFiltered,
       menuFilters,
       environmentQueries,
@@ -666,7 +714,7 @@ function PullRequestsRouteView() {
   // only ever append below what is already on screen. A search re-ranks the whole list by match,
   // so no partitions are read for one. These are the same atoms the Authored and Reviewing tabs
   // ask for, so switching to either is answered from cache.
-  const partitionsWanted = search.involvement === "all" && typedQuery.length === 0;
+  const partitionsWanted = !boardView && search.involvement === "all" && typedQuery.length === 0;
   // Built together so the two reads share one memo, and in the same field order the feed's own
   // input uses: the atoms are keyed by their input, so the Authored tab then reads this answer.
   const partitionTargets = useMemo(() => {
@@ -703,6 +751,8 @@ function PullRequestsRouteView() {
   // happens to be theirs: the list, the counts beside its rows, and whatever the panel is
   // showing. The panel owns its own reads, so it is told to redo them rather than reached into.
   const [detailRefreshToken, setDetailRefreshToken] = useState(0);
+  // The board's columns own their reads, so they are told to redo them the same way the panel is.
+  const [boardRefreshToken, setBoardRefreshToken] = useState(0);
   // The queries only go pending once the invalidation has come back, so refreshing is tracked
   // from the first moment rather than the second: a button that stays live through the slow half
   // of its own work is a button that gets pressed again, and buys the whole cascade twice.
@@ -723,6 +773,7 @@ function PullRequestsRouteView() {
     authoredQuery.refresh();
     reviewingQuery.refresh();
     statsQuery.refresh();
+    setBoardRefreshToken((token) => token + 1);
     setDetailRefreshToken((token) => token + 1);
   };
   const refreshing = invalidating || listQuery.isPending;
@@ -802,7 +853,9 @@ function PullRequestsRouteView() {
       // missing both the rows read on earlier pages and the hosts of whichever environment had
       // already run out of cursors. `ordered` carries the accumulated rows, and the baseline
       // read — which never drops an environment for lack of a cursor — carries the full hosts.
-      if (environmentKey.length > 0 && sentQuery.length === 0) {
+      // The snapshot is the flat list's own cold start; the board reads its columns and has
+      // nothing to hydrate from it.
+      if (!boardView && environmentKey.length > 0 && sentQuery.length === 0) {
         const accumulatedEntries = ordered?.key === filterKey ? ordered.entries : data.entries;
         writePullRequestListSnapshot(
           typeof window === "undefined" ? undefined : window.localStorage,
@@ -828,6 +881,7 @@ function PullRequestsRouteView() {
       };
     });
   }, [
+    boardView,
     environmentKey,
     scopeKey,
     sentQuery,
@@ -976,6 +1030,7 @@ function PullRequestsRouteView() {
       refreshList();
       authoredQuery.refresh();
       reviewingQuery.refresh();
+      setBoardRefreshToken((token) => token + 1);
     },
     { enabled: pullRequestsSupported },
   );
@@ -1334,6 +1389,19 @@ function PullRequestsRouteView() {
           title="Pull requests unavailable"
           error="Update your T3 Code servers to browse pull requests."
         />
+      ) : boardView ? (
+        <PullRequestBoardView
+          environmentQueries={environmentQueries}
+          scope={boardScope}
+          scopeKey={boardScopeKey}
+          refreshToken={boardRefreshToken}
+          // The board reads no listing of its own to learn the workspace's hosts from, so the
+          // hosts the projects name stand in for whether a row needs to say where it came from.
+          showProvider={hosts.length > 1 || expectedHosts.length > 1}
+          {...(capableEnvironments.length > 1 ? { environmentLabels } : {})}
+          selected={selected}
+          onSelect={selectEntry}
+        />
       ) : firstLoad ? (
         <PullRequestListGhost rows={7} />
       ) : listQuery.error && listData === null ? (
@@ -1449,8 +1517,32 @@ function PullRequestsRouteView() {
       Icon: environment.displayUrl === null ? MonitorIcon : ServerIcon,
     })),
   ];
+  // The two ways to read the same pull requests: the flat feed, or the board by review stage.
+  // Switched through the search itself so the open detail panel and the scope both survive it.
+  const viewToggle = (
+    <ToggleGroup
+      className="shrink-0 gap-1"
+      size="sm"
+      value={[boardView ? "board" : "list"]}
+      onValueChange={(value) => {
+        const next = value[0];
+        if (next === "list") updateSearch({ view: undefined });
+        if (next === "board") updateSearch({ view: "board" });
+      }}
+    >
+      <Toggle aria-label="List view" value="list" variant="ghost">
+        <Rows3Icon className="size-3.5" />
+      </Toggle>
+      <Toggle aria-label="Board view" value="board" variant="ghost">
+        <Columns3Icon className="size-3.5" />
+      </Toggle>
+    </ToggleGroup>
+  );
   const filtersMenu = (
     <PullRequestFiltersMenu
+      // The board's columns are its states and review decisions, so the menu keeps only the
+      // scope groups while it is showing.
+      showNarrowings={!boardView}
       state={search.state}
       stateOptions={STATE_TABS}
       onState={(state) => updateListScope({ state })}
@@ -1494,6 +1586,9 @@ function PullRequestsRouteView() {
     onHost: (host: string | undefined) => updateListScope({ host }),
     searchInput,
     filtersMenu,
+    viewToggle,
+    // The board owns state itself, so the condensed topbar drops the state menu with it.
+    showStateFilter: !boardView,
     rightPanelControl:
       // Footprint reserve while the panel is closed: the toggle itself stays
       // mounted at the fixed titlebar inset in both states so it cannot move
@@ -1770,6 +1865,8 @@ function PullRequestsColumn({
   onHost,
   searchInput,
   filtersMenu,
+  viewToggle,
+  showStateFilter,
   rightPanelControl,
   titlebarControls,
   rightPanelOpen,
@@ -1787,6 +1884,10 @@ function PullRequestsColumn({
   onHost: (host: string | undefined) => void;
   searchInput: ReactNode;
   filtersMenu: ReactNode;
+  /** List or board, in the controls row beside the filters. */
+  viewToggle: ReactNode;
+  /** False where the body owns the state narrowing itself, as the board's columns do. */
+  showStateFilter: boolean;
   rightPanelControl: ReactNode;
   titlebarControls: ReactNode;
   rightPanelOpen: boolean;
@@ -1874,13 +1975,15 @@ function PullRequestsColumn({
             </WorkspaceBreadcrumbItem>
             {searchExpanded ? null : <WorkspaceBreadcrumbSeparator />}
             <WorkspaceBreadcrumbItem className="shrink gap-1.5">
-              <CompactFilterMenu
-                label="Filter by state"
-                value={state}
-                options={STATE_TABS}
-                onChange={onState}
-                className="shrink-0"
-              />
+              {showStateFilter ? (
+                <CompactFilterMenu
+                  label="Filter by state"
+                  value={state}
+                  options={STATE_TABS}
+                  onChange={onState}
+                  className="shrink-0"
+                />
+              ) : null}
               <CompactFilterMenu
                 label="Filter by involvement"
                 value={involvement}
@@ -1934,6 +2037,7 @@ function PullRequestsColumn({
           <div className="flex flex-col gap-3">
             <div ref={inFlowSearchRef} className="flex items-center gap-2">
               {searchInput}
+              {viewToggle}
               {filtersMenu}
               {!condensed ? (
                 <PullRequestRefreshControl refreshing={refreshing} onRefresh={onRefresh} />

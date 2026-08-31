@@ -96,6 +96,8 @@ const REVIEW_VALUES: Record<string, PullRequestListFilters["review"]> = {
   required: "review-required",
   "review-required": "review-required",
   none: "none",
+  "not-approved": "not-approved",
+  unapproved: "not-approved",
 };
 const CHECKS_VALUES: Record<string, PullRequestListFilters["checks"]> = {
   success: "passing",
@@ -318,7 +320,13 @@ export function matchesPullRequestFilters(
     (filters.review === undefined ||
       (filters.review === "none"
         ? entry.reviewDecision === undefined
-        : entry.reviewDecision === filters.review)) &&
+        : // A row whose host does not summarise reviews carries no decision at all, and the
+          // server leaves those unnarrowed rather than guessing. Keeping them here too would
+          // have the local pass claim a GitLab row is "not approved" on no evidence, so this
+          // one only ever narrows rows that said what their review state is.
+          filters.review === "not-approved"
+          ? entry.reviewDecision !== undefined && entry.reviewDecision !== "approved"
+          : entry.reviewDecision === filters.review)) &&
     (filters.labels === undefined || filters.labels.every((group) => group.some(holds))) &&
     (filters.excludedLabels === undefined || !filters.excludedLabels.some(holds)) &&
     (filters.author === undefined ||
@@ -466,6 +474,12 @@ export interface MergedPullRequestList {
    * asking still happens once every other environment has run out of cursors.
    */
   readonly truncatedEnvironments: ReadonlyArray<string>;
+  /**
+   * How many change requests match this listing in total, summed across the environments. Present
+   * only where every one of them reported a total: a sum missing an environment's share is a
+   * number the reader would take for the whole, so it is left out instead.
+   */
+  readonly totalCount?: number | undefined;
 }
 
 /**
@@ -484,7 +498,13 @@ export function mergePullRequestLists(
   const errors: EnvironmentPullRequestError[] = [];
   const nextCursors: Record<string, PullRequestListCursors> = {};
   let truncated = false;
+  /** Null the moment one environment could not say how many it has; a partial sum is a lie. */
+  let totalCount: number | null = 0;
   for (const [environmentId, answer] of answers) {
+    totalCount =
+      totalCount === null || answer.totalCount === undefined
+        ? null
+        : totalCount + answer.totalCount;
     for (const [host, login] of Object.entries(answer.viewers)) {
       viewers[`${environmentId} ${host}`] = login;
     }
@@ -518,6 +538,7 @@ export function mergePullRequestLists(
     truncated,
     nextCursors,
     truncatedEnvironments,
+    ...(totalCount === null ? {} : { totalCount }),
   };
 }
 

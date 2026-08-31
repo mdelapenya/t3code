@@ -9,6 +9,7 @@ import type {
 import {
   CircleCheckIcon,
   CircleDashedIcon,
+  CircleDotIcon,
   CircleSlashIcon,
   CircleXIcon,
   EyeOffIcon,
@@ -130,6 +131,9 @@ const REVIEW_OPTIONS = [
   { value: "approved", label: "Approved", Icon: CircleCheckIcon },
   { value: "changes-requested", label: "Changes requested", Icon: CircleXIcon },
   { value: "review-required", label: "Review required", Icon: CircleDashedIcon },
+  // Everything still waiting on an approval, including what nobody has reviewed yet — the same
+  // thing the board's "In review" column is.
+  { value: "not-approved", label: "Not approved", Icon: CircleDotIcon },
   { value: "none", label: "No reviews", Icon: CircleSlashIcon },
 ] as const satisfies ReadonlyArray<PullRequestFilterOption<string>>;
 
@@ -208,6 +212,7 @@ export function PullRequestFiltersMenu({
   projectEnvironmentId,
   unavailable,
   onProject,
+  showNarrowings = true,
 }: {
   state: PullRequestListState;
   stateOptions: ReadonlyArray<PullRequestFilterOption<PullRequestListState>>;
@@ -253,14 +258,19 @@ export function PullRequestFiltersMenu({
   unavailable: ReadonlyMap<string, string>;
   /** The environment comes with the project id, since picking a row picks a specific server's copy of it. */
   onProject: (projectId: ProjectId | undefined, environmentId: EnvironmentId | undefined) => void;
+  /**
+   * Whether state, draft, review and checks are this menu's to offer. The board view owns those
+   * itself — a column is a state and a review decision — so it keeps the scope groups and drops
+   * the narrowings that would fight its own columns.
+   */
+  showNarrowings?: boolean;
 }) {
   const filtered =
-    state !== "open" ||
+    (showNarrowings && (state !== "open" || Object.keys(filters).length > 0)) ||
     involvement !== "all" ||
     host !== undefined ||
     server !== undefined ||
-    projectId !== undefined ||
-    Object.keys(filters).length > 0;
+    projectId !== undefined;
   /**
    * Rebuilt rather than spread so an unfiltered group leaves the record instead of lingering in
    * it as an explicit `undefined`, which the listing input does not accept.
@@ -292,40 +302,48 @@ export function PullRequestFiltersMenu({
         ) : null}
       </MenuTrigger>
       <MenuPopup align="end" side="bottom" className="min-w-56">
-        <PullRequestFilterRadioGroup
-          label="State"
-          value={state}
-          options={stateOptions}
-          onChange={onState}
-        />
-        <MenuSeparator />
+        {showNarrowings ? (
+          <>
+            <PullRequestFilterRadioGroup
+              label="State"
+              value={state}
+              options={stateOptions}
+              onChange={onState}
+            />
+            <MenuSeparator />
+          </>
+        ) : null}
         <PullRequestFilterRadioGroup
           label="Involvement"
           value={involvement}
           options={involvementOptions}
           onChange={onInvolvement}
         />
-        <MenuSeparator />
-        <PullRequestFilterRadioGroup
-          label="Draft"
-          value={filters.draft ?? UNFILTERED_VALUE}
-          options={DRAFT_OPTIONS}
-          onChange={(next) => onFilters(withFilter("draft", next))}
-        />
-        <MenuSeparator />
-        <PullRequestFilterRadioGroup
-          label="Review"
-          value={filters.review ?? UNFILTERED_VALUE}
-          options={REVIEW_OPTIONS}
-          onChange={(next) => onFilters(withFilter("review", next))}
-        />
-        <MenuSeparator />
-        <PullRequestFilterRadioGroup
-          label="Checks"
-          value={filters.checks ?? UNFILTERED_VALUE}
-          options={CHECKS_OPTIONS}
-          onChange={(next) => onFilters(withFilter("checks", next))}
-        />
+        {showNarrowings ? (
+          <>
+            <MenuSeparator />
+            <PullRequestFilterRadioGroup
+              label="Draft"
+              value={filters.draft ?? UNFILTERED_VALUE}
+              options={DRAFT_OPTIONS}
+              onChange={(next) => onFilters(withFilter("draft", next))}
+            />
+            <MenuSeparator />
+            <PullRequestFilterRadioGroup
+              label="Review"
+              value={filters.review ?? UNFILTERED_VALUE}
+              options={REVIEW_OPTIONS}
+              onChange={(next) => onFilters(withFilter("review", next))}
+            />
+            <MenuSeparator />
+            <PullRequestFilterRadioGroup
+              label="Checks"
+              value={filters.checks ?? UNFILTERED_VALUE}
+              options={CHECKS_OPTIONS}
+              onChange={(next) => onFilters(withFilter("checks", next))}
+            />
+          </>
+        ) : null}
         {hostOptions.length > 2 ? (
           <>
             <MenuSeparator />
