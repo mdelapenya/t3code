@@ -49,8 +49,12 @@ const PullRequestQualifierValues = Schema.Array(PullRequestQualifierValue).check
  */
 export const PullRequestListFilters = Schema.Struct({
   draft: Schema.optional(Schema.Literals(["only", "hide"])),
+  /**
+   * `"not-approved"` means the change request has not been approved — review still required,
+   * changes requested, or no review yet (GitHub's `-review:approved`).
+   */
   review: Schema.optional(
-    Schema.Literals(["approved", "changes-requested", "review-required", "none"]),
+    Schema.Literals(["approved", "changes-requested", "review-required", "none", "not-approved"]),
   ),
   checks: Schema.optional(Schema.Literals(["passing", "failing"])),
   /**
@@ -580,6 +584,13 @@ export const PullRequestListResult = Schema.Struct({
    * more rows are only reachable by raising `limit`, the way they always were.
    */
   nextCursors: PullRequestListCursors,
+  /**
+   * The exact number of change requests matching this listing across every repository it
+   * covers, present only when every repository was read through a host search that reports
+   * its own total (GitHub's `issueCount`, capped by GitHub at 1000). Absent whenever any read
+   * had to fall back to per-repository listing, so a number shown is never silently short.
+   */
+  totalCount: Schema.optional(NonNegativeInt),
 });
 export type PullRequestListResult = typeof PullRequestListResult.Type;
 

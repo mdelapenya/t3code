@@ -75,6 +75,17 @@ describe("PullRequestListResult", () => {
     const decoded = Schema.decodeUnknownSync(codec)(Schema.encodeUnknownSync(codec)(LIST_RESULT));
 
     expect(decoded).toStrictEqual(LIST_RESULT);
+    expect(decoded.totalCount).toBeUndefined();
+  });
+
+  it("round-trips a total count, present when a host search reported one", () => {
+    const withTotal: PullRequestListResult = { ...LIST_RESULT, totalCount: 1 };
+    const codec = Schema.toCodecJson(PullRequestListResult);
+
+    const decoded = Schema.decodeUnknownSync(codec)(Schema.encodeUnknownSync(codec)(withTotal));
+
+    expect(decoded).toStrictEqual(withTotal);
+    expect(decoded.totalCount).toBe(1);
   });
 
   it("keys a viewer by host, so two hosts of one kind stay separate accounts", () => {
