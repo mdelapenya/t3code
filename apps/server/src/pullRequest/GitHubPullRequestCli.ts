@@ -296,6 +296,8 @@ export interface GitHubPullRequestSearchBatch {
   /** Rows across every repository asked for, newest update first, each naming its own. */
   readonly items: ReadonlyArray<GitHubPullRequestSearchItem>;
   readonly truncated: boolean;
+  /** How many rows the whole search matches, as GitHub counts them, when it said. */
+  readonly totalCount?: number;
 }
 
 export interface GitHubPullRequestDiffSlice {
@@ -609,12 +611,17 @@ function searchPhrase(query: string): string {
   return `"${query.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
-/** GitHub's own spelling of a review state, which is not the contract's. */
+/**
+ * Whole qualifiers rather than bare values, because not every review filter is a `review:` at
+ * all: "not approved" is GitHub's negation of the approved one, which also takes in the rows no
+ * `review:` value names — the ones nobody has reviewed yet.
+ */
 const REVIEW_QUALIFIERS = {
-  approved: "approved",
-  "changes-requested": "changes_requested",
-  "review-required": "required",
-  none: "none",
+  approved: "review:approved",
+  "changes-requested": "review:changes_requested",
+  "review-required": "review:required",
+  none: "review:none",
+  "not-approved": "-review:approved",
 } as const;
 
 /**
@@ -641,7 +648,7 @@ function filterQualifiers(
       ? []
       : [`author:${qualifierValue(resolvePullRequestAuthorFilter(filters.author, viewer))}`]),
     ...(filters.draft === undefined ? [] : [`draft:${filters.draft === "only"}`]),
-    ...(filters.review === undefined ? [] : [`review:${REVIEW_QUALIFIERS[filters.review]}`]),
+    ...(filters.review === undefined ? [] : [REVIEW_QUALIFIERS[filters.review]]),
     ...(filters.checks === undefined
       ? []
       : [`status:${filters.checks === "passing" ? "success" : "failure"}`]),
@@ -669,7 +676,11 @@ function matchesFilters(
     (filters.review === undefined ||
       (filters.review === "none"
         ? item.reviewDecision === null
-        : item.reviewDecision === filters.review)) &&
+        : filters.review === "not-approved"
+          ? // The negation GitHub's own `-review:approved` performs, which keeps the rows with no
+            // decision at all rather than only the ones somebody has already judged.
+            item.reviewDecision !== "approved"
+          : item.reviewDecision === filters.review)) &&
     (filters.checks === undefined || item.checksState === filters.checks) &&
     (filters.labels === undefined || filters.labels.every((group) => group.some(holds))) &&
     (filters.excludedLabels === undefined || !filters.excludedLabels.some(holds)) &&
@@ -1281,9 +1292,12 @@ export const make = Effect.gen(function* () {
         query: pullRequestSearchGraphQlQuery(rows),
         decode: decodePullRequestSearchJson,
       }).pipe(
+        // `truncated` is about this slice and stays on the rows the page actually holds;
+        // `totalCount` is GitHub's count of the whole search, which says nothing about paging.
         Effect.map((batch) => ({
           items: batch.items.slice(0, input.limit),
           truncated: batch.rawCount > input.limit || batch.hasNextPage,
+          ...(batch.totalCount === undefined ? {} : { totalCount: batch.totalCount }),
         })),
       );
     },

@@ -139,10 +139,11 @@ describe("pull request list decoding", () => {
 });
 
 describe("pull request search decoding", () => {
-  function searchJson(rollupStates: ReadonlyArray<string | null>): string {
+  function searchJson(rollupStates: ReadonlyArray<string | null>, issueCount?: number): string {
     return JSON.stringify({
       data: {
         search: {
+          ...(issueCount === undefined ? {} : { issueCount }),
           pageInfo: { hasNextPage: false },
           nodes: rollupStates.map((state, index) => ({
             number: index + 1,
@@ -178,6 +179,19 @@ describe("pull request search decoding", () => {
       "pending",
       null,
     ]);
+  });
+
+  it("reads the search's own count of every match, and leaves it absent when unasked", () => {
+    // The count is of the whole search, so it is nothing like the slice: two rows, 1000 matches
+    // — GitHub's own ceiling on what it will count.
+    const counted = expectSuccess(decodePullRequestSearchJson(searchJson([null, null], 1000)));
+    expect(counted.totalCount).toBe(1000);
+    expect(counted.rawCount).toBe(2);
+
+    // A host answering without the field says nothing about how many there are, and a count
+    // guessed from the page would be a lie the caller cannot see through.
+    const uncounted = expectSuccess(decodePullRequestSearchJson(searchJson([null])));
+    expect(uncounted.totalCount).toBeUndefined();
   });
 });
 

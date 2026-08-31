@@ -187,6 +187,9 @@ const RawSearchItemSchema = Schema.Struct({
 const RawSearchSchema = Schema.Struct({
   data: Schema.Struct({
     search: Schema.Struct({
+      // How many rows the search matches in all, which no page of it can say. Optional because a
+      // host that answers without the field must still hand its rows over.
+      issueCount: Schema.optional(Schema.NullOr(Schema.Int)),
       pageInfo: Schema.optional(Schema.NullOr(Schema.Struct({ hasNextPage: Schema.Boolean }))),
       // Row by row, like the listing's own: a node that is not a pull request — or one field
       // GitHub changes — is skipped rather than blanking every repository at once.
@@ -630,6 +633,7 @@ export const PULL_REQUEST_SEARCH_MAX_ROWS = GRAPHQL_PAGE_SIZE;
 export function pullRequestSearchGraphQlQuery(rows: number): string {
   return `query($q: String!) {
   search(query: $q, type: ISSUE, first: ${Math.min(Math.max(Math.trunc(rows), 1), PULL_REQUEST_SEARCH_MAX_ROWS)}) {
+    issueCount
     pageInfo { hasNextPage }
     nodes {
       ... on PullRequest {
@@ -1435,6 +1439,13 @@ export interface GitHubPullRequestSearchBatch {
   readonly rawCount: number;
   /** More rows than this slice asked for, which is truncation for every repository in it. */
   readonly hasNextPage: boolean;
+  /**
+   * Every row the search matches, not just this slice's, as GitHub's own `issueCount`. GitHub
+   * stops counting at 1000, so a larger search reports exactly a thousand; absent when the host
+   * did not answer with the field, which is the only honest thing to say about a count nobody
+   * gave. Paging never reads it — that is `rawCount` and `hasNextPage`.
+   */
+  readonly totalCount?: number;
 }
 
 /**
@@ -1478,10 +1489,12 @@ export function decodePullRequestSearchJson(
       repository,
     });
   }
+  const totalCount = decoded.success.data.search.issueCount;
   return Result.succeed({
     items,
     rawCount: nodes.length,
     hasNextPage: decoded.success.data.search.pageInfo?.hasNextPage ?? false,
+    ...(totalCount === undefined || totalCount === null ? {} : { totalCount }),
   });
 }
 

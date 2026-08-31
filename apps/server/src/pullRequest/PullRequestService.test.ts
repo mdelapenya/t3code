@@ -2693,6 +2693,97 @@ it.effect("reads the repositories one at a time when the search itself fails", (
     assert.strictEqual(result.entries.length, 2);
   }),
 );
+it.effect("sums the hosts' own counts when every repository was searched", () =>
+  Effect.gen(function* () {
+    const countFor: Record<string, number> = { "github.com": 20, "github.acme.dev": 22 };
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "web", workspaceRoot: "/cloud", repository: "acme/web" }),
+        project({ id: "p2", title: "docs", workspaceRoot: "/cloud", repository: "acme/docs" }),
+        project({
+          id: "p3",
+          title: "enterprise",
+          workspaceRoot: "/enterprise",
+          repository: "acme/internal",
+          host: "github.acme.dev",
+        }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          listChangeRequestsAcross: (input) =>
+            Effect.succeed({
+              items: input.repositories.map((repository, index) =>
+                batchedChangeRequest(index + 1, repository, "2026-07-02T00:00:00Z"),
+              ),
+              truncated: false,
+              totalCount: countFor[input.host]!,
+            }),
+        }),
+      ],
+    });
+
+    const result = yield* service.list({ state: "open" });
+
+    // One count per search, and the two hosts are two searches — the page holds three rows and
+    // still says how many there are behind them.
+    assert.strictEqual(result.totalCount, 42);
+    assert.strictEqual(result.entries.length, 3);
+  }),
+);
+
+it.effect("gives no count at all when any repository was read the long way", () =>
+  Effect.gen(function* () {
+    const projects = [
+      project({ id: "p1", title: "web", workspaceRoot: "/a", repository: "acme/web" }),
+      project({ id: "p2", title: "docs", workspaceRoot: "/b", repository: "acme/docs" }),
+    ];
+    const alone = {
+      listChangeRequests: () =>
+        Effect.succeed({
+          items: [changeRequest(1, "2026-07-02T00:00:00Z")],
+          truncated: false,
+          continues: true,
+        }),
+    };
+
+    const blindService = yield* makeService({
+      projects,
+      providers: [
+        fakeProvider("github", {
+          ...alone,
+          listChangeRequestsAcross: (input) =>
+            Effect.succeed({
+              // The search is blind to the second repository — a renamed one, or one GitHub does
+              // not index — so it says nothing about it and the service reads it on its own.
+              items: input.repositories
+                .filter((repository) => repository === "acme/web")
+                .map((repository) => batchedChangeRequest(1, repository, "2026-07-02T00:00:00Z")),
+              truncated: false,
+              totalCount: 9,
+            }),
+        }),
+      ],
+    });
+    const failedService = yield* makeService({
+      projects,
+      providers: [
+        fakeProvider("github", {
+          ...alone,
+          listChangeRequestsAcross: () => Effect.fail(requestFailed),
+        }),
+      ],
+    });
+
+    const blind = yield* blindService.list({ state: "open" });
+    const failed = yield* failedService.list({ state: "open" });
+
+    // A count of what one search matched says nothing about the rows another read found, so
+    // rather than report a total that is short by a repository, the page reports none.
+    assert.isUndefined(blind.totalCount);
+    assert.isUndefined(failed.totalCount);
+  }),
+);
+
 it.effect("fills in the line counts for the rows it is given", () =>
   Effect.gen(function* () {
     const asked: Array<unknown> = [];
@@ -3192,6 +3283,11 @@ it.effect("judges the review filter only on a host that summarises its reviews",
 
     const approved = yield* service.list({ state: "open", filters: { review: "approved" } });
     assert.deepStrictEqual(approved.entries.map((entry) => entry.number).toSorted(), [2, 3]);
+
+    // "Not approved" is the negation, so the undecided GitHub row belongs to it and the approved
+    // one does not — and the GitLab row stays unnarrowed here as it does under every other value.
+    const pending = yield* service.list({ state: "open", filters: { review: "not-approved" } });
+    assert.deepStrictEqual(pending.entries.map((entry) => entry.number).toSorted(), [1, 3]);
   }),
 );
 

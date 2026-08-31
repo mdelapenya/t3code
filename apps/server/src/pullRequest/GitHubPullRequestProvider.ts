@@ -207,6 +207,7 @@ export const make = Effect.gen(function* () {
           Effect.mapError(fail("listChangeRequestsAcross")),
           Effect.map((batch) => ({
             truncated: batch.truncated,
+            ...(batch.totalCount === undefined ? {} : { totalCount: batch.totalCount }),
             items: batch.items.map((item) => ({
               ...item,
               author: withAvatar(item.author, new Map<string, string>(), input.host),

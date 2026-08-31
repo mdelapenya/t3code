@@ -165,8 +165,19 @@ function searchItem(number: number, repository: string, updatedAt: string) {
   };
 }
 
-function searchPage(nodes: ReadonlyArray<unknown>, hasNextPage = false) {
-  return output(JSON.stringify({ data: { search: { pageInfo: { hasNextPage }, nodes } } }));
+/** `issueCount` is left out unless a test is about it, the way an older host answers. */
+function searchPage(nodes: ReadonlyArray<unknown>, hasNextPage = false, issueCount?: number) {
+  return output(
+    JSON.stringify({
+      data: {
+        search: {
+          ...(issueCount === undefined ? {} : { issueCount }),
+          pageInfo: { hasNextPage },
+          nodes,
+        },
+      },
+    }),
+  );
 }
 
 /** The search a batched read sent, which travels in the request body rather than in argv. */
@@ -467,6 +478,51 @@ layer("GitHubPullRequestCli.layer", (it) => {
     }),
   );
 
+  it.effect("hands on GitHub's own count of the search, and pages without it", () =>
+    Effect.gen(function* () {
+      mockedExecute
+        .mockReturnValueOnce(
+          Effect.succeed(
+            searchPage(
+              [
+                searchItem(1, "acme/web", "2026-07-03T00:00:00Z"),
+                searchItem(2, "acme/web", "2026-07-02T00:00:00Z"),
+                searchItem(3, "acme/web", "2026-07-01T00:00:00Z"),
+              ],
+              false,
+              417,
+            ),
+          ),
+        )
+        .mockReturnValueOnce(
+          Effect.succeed(searchPage([searchItem(1, "acme/web", "2026-07-03T00:00:00Z")])),
+        );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+      const read = () =>
+        cli.searchPullRequests({
+          cwd: "/w",
+          host: "github.com",
+          repositories: ["acme/web"],
+          state: "open",
+          involvement: "all",
+          viewer: "bilal",
+          limit: 2,
+        });
+
+      const counted = yield* read();
+      const uncounted = yield* read();
+
+      // The count is of the whole search rather than of the slice, and the slice is still cut
+      // and judged truncated by the rows themselves.
+      assert.strictEqual(counted.totalCount, 417);
+      assert.strictEqual(counted.items.length, 2);
+      assert.isTrue(counted.truncated);
+      // A host that did not answer with the field leaves it absent rather than guessed at.
+      assert.isUndefined(uncounted.totalCount);
+      assert.isFalse(uncounted.truncated);
+    }),
+  );
+
   it.effect("reads the line counts in chunks, and files them back by position", () =>
     Effect.gen(function* () {
       const changeRequests = Array.from({ length: 26 }, (_, index) => ({
@@ -591,6 +647,28 @@ layer("GitHubPullRequestCli.layer", (it) => {
         'label:"needs design" label:"quote" -label:"wip" author:"octocat" draft:false ' +
           "review:changes_requested status:failure sort:updated-desc",
       );
+    }),
+  );
+
+  it.effect('sends "not approved" as the negation of the approved qualifier', () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValue(Effect.succeed(output("[]")));
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      yield* cli.listPullRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        state: "open",
+        involvement: "all",
+        viewer: "bilal",
+        limit: 10,
+        filters: { draft: "hide", review: "not-approved" },
+      });
+
+      // Not a `review:` value of its own: GitHub has no word for "anything but approved", and
+      // negating the one it does have is what also keeps the rows nobody has reviewed.
+      expect(searchOfCall(0)).toBe("draft:false -review:approved sort:updated-desc");
     }),
   );
 
@@ -739,6 +817,38 @@ layer("GitHubPullRequestCli.layer", (it) => {
       }),
   );
 
+  it.effect('keeps an unreviewed row under "not approved" on the search-free fallback', () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("[]")));
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            pullRequests(3, 1, (number) => ({
+              // Nobody has reviewed the third one, which GitHub answers for with null.
+              reviewDecision: number === 1 ? "APPROVED" : number === 2 ? "CHANGES_REQUESTED" : null,
+            })),
+          ),
+        ),
+      );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      const batch = yield* cli.listPullRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        state: "open",
+        involvement: "all",
+        viewer: "bilal",
+        limit: 10,
+        filters: { review: "not-approved" },
+      });
+
+      // The negation the search would have performed, judged locally: everything but approved,
+      // including the row no review has landed on.
+      expect(batch.items.map((item) => item.number)).toEqual([2, 3]);
+    }),
+  );
+
   it.effect("carries the further narrowings into a batched search", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValue(Effect.succeed(searchPage([])));
@@ -758,6 +868,29 @@ layer("GitHubPullRequestCli.layer", (it) => {
       assert.strictEqual(
         searchQueryOfCall(0),
         'is:pr is:open label:"bug" draft:true review:none sort:updated-desc repo:acme/web',
+      );
+    }),
+  );
+
+  it.effect('carries "not approved" into a batched search as one negated qualifier', () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValue(Effect.succeed(searchPage([])));
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      yield* cli.searchPullRequests({
+        cwd: "/w",
+        host: "github.com",
+        repositories: ["acme/web"],
+        state: "open",
+        involvement: "all",
+        viewer: "bilal",
+        limit: 10,
+        filters: { draft: "hide", review: "not-approved" },
+      });
+
+      assert.strictEqual(
+        searchQueryOfCall(0),
+        "is:pr is:open draft:false -review:approved sort:updated-desc repo:acme/web",
       );
     }),
   );

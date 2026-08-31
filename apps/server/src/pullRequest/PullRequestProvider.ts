@@ -141,6 +141,12 @@ export interface ProviderBatchedChangeRequestPage {
   readonly items: ReadonlyArray<ProviderBatchedChangeRequest>;
   /** True when the host has more rows than the slice asked for, for any of the repositories. */
   readonly truncated: boolean;
+  /**
+   * Every row the question matches across the repositories it named, when the host counts them
+   * itself. Absent from a host that does not, and never inferred from the slice — a caller that
+   * needs an exact number would rather have none than a page's worth.
+   */
+  readonly totalCount?: number;
 }
 
 /** The line counts for one change request, which a listing may leave for a second read. */

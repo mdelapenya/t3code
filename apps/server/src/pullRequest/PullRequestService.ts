@@ -106,7 +106,8 @@ const LIST_STATS_CACHE_TTL = Duration.seconds(60);
 const DIFF_STALE_WINDOW = Duration.minutes(10);
 /** How long one host's signed-in login is believed without asking its CLI again. */
 const VIEWER_CACHE_TTL = Duration.minutes(10);
-const LIST_CACHE_CAPACITY = 64;
+/** Cursors are part of the key, and a board pages several listings side by side rather than one. */
+const LIST_CACHE_CAPACITY = 128;
 const LIST_STATS_CACHE_CAPACITY = 32;
 const DETAIL_CACHE_CAPACITY = 128;
 const DIFF_CACHE_CAPACITY = 128;
@@ -762,7 +763,11 @@ export const make = Effect.gen(function* () {
         item.reviewDecision === undefined ||
         (filters.review === "none"
           ? item.reviewDecision === null
-          : item.reviewDecision === filters.review)) &&
+          : filters.review === "not-approved"
+            ? // The negation the host performed, over the rows it handed back: no decision yet
+              // counts as not approved, the same way GitHub's `-review:approved` reads it.
+              item.reviewDecision !== "approved"
+            : item.reviewDecision === filters.review)) &&
       (filters.labels === undefined || filters.labels.every((group) => group.some(holds))) &&
       (filters.excludedLabels === undefined || !filters.excludedLabels.some(holds)) &&
       (filters.author === undefined ||
@@ -909,11 +914,31 @@ export const make = Effect.gen(function* () {
         continuation?.get(listCursorKey(project.host, project.repository));
 
       /**
+       * How many change requests this listing matches in all, summed from the hosts that count
+       * their own searches. It survives only while every repository was read through such a
+       * search: `null` is a total nobody can stand behind — a listing missing whatever the reads
+       * that could not count hold — and once it is null it stays null.
+       */
+      let searchTotal: number | null = 0;
+      const uncountable = () => {
+        searchTotal = null;
+      };
+      const countSearched = (total: number | undefined) => {
+        if (searchTotal === null) return;
+        searchTotal = total === undefined ? null : searchTotal + total;
+      };
+
+      /**
        * One repository asked on its own. What every host without a search across repositories
        * does, and what a batched read falls back to for a repository it could not answer for.
+       *
+       * A read the long way counts nothing, so it is what takes the total away: every caller of
+       * this — a host with no batched search, a chunk that failed over, a repository the search
+       * was silent about — is a place the sum would otherwise be short.
        */
       const readRepository = (project: SupportedProject): Effect.Effect<RepositoryBatch> => {
         {
+          uncountable();
           const viewer = viewers[project.host]!;
           const key = listCursorKey(project.host, project.repository);
           const cursor = cursorOf(project);
@@ -1019,6 +1044,7 @@ export const make = Effect.gen(function* () {
             : { cursor: { updatedBefore: cursor.updatedBefore, delivered: cursor.delivered } }),
         }).pipe(
           Effect.flatMap((page) => {
+            countSearched(page.totalCount);
             const rows = new Map<string, Array<ProviderChangeRequest>>();
             for (const item of page.items) {
               const key = item.repository.trim().toLowerCase();
@@ -1116,6 +1142,7 @@ export const make = Effect.gen(function* () {
         errors: [...unreadable, ...batches.flatMap((batch) => batch.errors)],
         truncated: batches.some((batch) => batch.truncated),
         nextCursors,
+        ...(searchTotal === null ? {} : { totalCount: searchTotal }),
       };
     });
 
