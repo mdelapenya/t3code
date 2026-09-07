@@ -441,6 +441,31 @@ function formatDesktopSbxError(error: unknown): string {
   return withoutTaggedErrorPrefix.trim() || fallback;
 }
 
+const CLERK_TOKEN_TIMEOUT_MS = 4000;
+
+// Clerk's getToken awaits an internal "loaded" promise that only resolves once
+// clerk-js reaches ready/degraded, and that promise never rejects — so an
+// offline or blocked clerk-js would otherwise hang the caller forever. Race it
+// against a short timeout and treat a timeout like "not signed in", same as a
+// null getter or a thrown error.
+function getClerkTokenWithTimeout(
+  getClerkToken: (() => Promise<string | null>) | null,
+): Promise<string | null> {
+  if (!getClerkToken) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve(null), CLERK_TOKEN_TIMEOUT_MS);
+    getClerkToken()
+      .then((token) => {
+        window.clearTimeout(timer);
+        resolve(token ?? null);
+      })
+      .catch(() => {
+        window.clearTimeout(timer);
+        resolve(null);
+      });
+  });
+}
+
 const ENDPOINT_ROW_CLASSNAME = "first:rounded-t-xl last:rounded-b-xl px-3 py-2.5 sm:px-4";
 
 type AccessSectionPresentation = "current" | "endpoint-rail";
@@ -3045,39 +3070,41 @@ export function ConnectionsSettings() {
       const removed = await performRemoveSavedBackend(pending.environmentId);
       if (!removed) return;
 
+      if (removeSandbox) {
+        try {
+          await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
+          toastManager.add({
+            type: "success",
+            title: "Sandbox removed",
+            description: `Docker sandbox “${pending.sandboxName}” was deleted.`,
+          });
+        } catch (error) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not remove sandbox",
+              description: formatDesktopSbxError(error),
+            }),
+          );
+        }
+      }
+
       // connectSandboxSshTarget links the sandbox to T3 Connect's relay, but
       // nothing in the environment registry reverses that when the saved
       // backend is removed, so the relay link would otherwise outlive the
-      // local record. Best effort: unlinkSandboxEnvironmentFromRelay swallows
-      // and logs its own failures, so a relay hiccup here never blocks this
-      // removal, which has already succeeded. getClerkToken is null in
-      // cloudless builds (no ClerkProvider) — treat that like "not signed in"
-      // and skip the unlink attempt.
-      const clerkToken = (await getClerkToken?.().catch(() => null)) ?? null;
-      if (clerkToken) {
-        void unlinkSandboxEnvironmentRelayLink({
-          environmentId: pending.environmentId,
-          clerkToken,
-        });
-      }
-
-      if (!removeSandbox) return;
-      try {
-        await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
-        toastManager.add({
-          type: "success",
-          title: "Sandbox removed",
-          description: `Docker sandbox “${pending.sandboxName}” was deleted.`,
-        });
-      } catch (error) {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not remove sandbox",
-            description: formatDesktopSbxError(error),
-          }),
-        );
-      }
+      // local record. Best effort and strictly fire-and-forget: the removal
+      // above has already completed (and the sandbox may already be gone
+      // too), so nothing here — including the Clerk token fetch — may gate
+      // or delay it. unlinkSandboxEnvironmentFromRelay swallows and logs its
+      // own failures.
+      void getClerkTokenWithTimeout(getClerkToken).then((clerkToken) => {
+        if (clerkToken) {
+          void unlinkSandboxEnvironmentRelayLink({
+            environmentId: pending.environmentId,
+            clerkToken,
+          });
+        }
+      });
     },
     [
       getClerkToken,
@@ -3096,9 +3123,10 @@ export function ConnectionsSettings() {
     async (target: DesktopSshEnvironmentTarget) => {
       setIsAddingSavedBackend(true);
       setSavedBackendError(null);
-      // getClerkToken is null in cloudless builds (no ClerkProvider) — treat
-      // that like "not signed in" and connect over SSH only.
-      const clerkToken = (await getClerkToken?.().catch(() => null)) ?? null;
+      // getClerkToken is null in cloudless builds (no ClerkProvider), and
+      // getClerkTokenWithTimeout bounds an offline/blocked clerk-js — both
+      // cases are treated like "not signed in" and connect over SSH only.
+      const clerkToken = await getClerkTokenWithTimeout(getClerkToken);
       const result = await connectAndLinkSandboxEnvironment({ target, label: "", clerkToken });
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
