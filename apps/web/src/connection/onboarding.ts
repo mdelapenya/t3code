@@ -49,9 +49,11 @@ export const connectSshEnvironment = createRuntimeCommand(connectionAtomRuntime,
  *
  * Relay activation is fire-and-forget: a failure is logged as a warning and
  * does not roll back the SSH registration. The result reports whether relay
- * activation succeeded via `relayLinked` so the caller can be honest about it;
- * there is no dedicated retry control for a sandbox environment, but
- * reconnecting the sandbox (running this command again) re-attempts the link.
+ * activation succeeded via `relayLinked` so the caller can be honest about it.
+ * There is no dedicated retry control for the link, and the environment's own
+ * reconnect action (`retryNow`) never re-attempts it — only removing the
+ * saved environment and adding it again, which invokes this command again,
+ * does.
  */
 export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionAtomRuntime, {
   label: "web:connection:connect-and-link-sandbox",

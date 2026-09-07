@@ -167,8 +167,10 @@ If you are signed in to T3 Connect, connecting the sandbox also links it to
 T3 Connect automatically, so it stays reachable from the mobile app and
 app.t3.codes without any extra setup. If you are not signed in, the sandbox
 connects over SSH only. The same is true if the link attempt itself fails —
-the SSH connection still succeeds, and reconnecting the sandbox tries the
-link again.
+the SSH connection still succeeds, but T3 Connect is not linked. To retry the
+link, remove the sandbox environment and add it again from **Existing
+sandboxes**; the underlying sandbox is untouched unless you choose to delete
+it.
 
 The sandbox appears as an SSH environment at `<name>.sbx`, and everything from
 the section above applies, including reconnects and server updates, aside
