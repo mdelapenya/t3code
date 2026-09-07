@@ -2453,6 +2453,31 @@ function CloudRemoteEnvironmentRows({
   ) : null;
 }
 
+// Clerk's useAuth() throws when no ClerkProvider is mounted, which is the case
+// in cloudless builds (see main.tsx, which only mounts one when
+// VITE_CLERK_PUBLISHABLE_KEY is set). ConnectionsSettings itself needs Clerk's
+// token getter for sandbox relay activation, but must render (and its SSH/sandbox
+// flows must work) even without Clerk configured. Rendering this child only
+// under hasCloudPublicConfig() — same guard as CloudLinkRow — keeps the
+// useAuth() call out of ConnectionsSettings' own render, so rules-of-hooks
+// never sees it called conditionally.
+function ClerkTokenBridge({
+  onGetClerkTokenChange,
+}: {
+  readonly onGetClerkTokenChange: (getClerkToken: (() => Promise<string | null>) | null) => void;
+}) {
+  const { getToken } = useAuth();
+  useEffect(() => {
+    // Declaring this getter as `async` guarantees that a synchronous throw
+    // from resolveRelayClerkTokenOptions() (missing JWT template config)
+    // becomes a rejected promise instead of escaping the call site, so every
+    // caller's `.catch(() => null)` actually catches it.
+    onGetClerkTokenChange(async () => getToken(resolveRelayClerkTokenOptions()));
+    return () => onGetClerkTokenChange(null);
+  }, [getToken, onGetClerkTokenChange]);
+  return null;
+}
+
 export function ConnectionsSettings() {
   const desktopBridge = window.desktopBridge;
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -2468,7 +2493,22 @@ export function ConnectionsSettings() {
   const unlinkSandboxEnvironmentRelayLink = useAtomCommand(unlinkSandboxEnvironmentRelayLinkAtom, {
     reportFailure: false,
   });
-  const { getToken: getClerkToken } = useAuth();
+  // Null in cloudless builds (no ClerkProvider mounted) — see ClerkTokenBridge.
+  // Sandbox connect/remove flows treat a null getter the same as "not signed
+  // in": SSH-only, no relay link attempt. Boxed in an object because
+  // useState's setter reads a bare function argument as a functional
+  // updater, not as the value to store — wrapping sidesteps that ambiguity.
+  const [clerkTokenGetter, setClerkTokenGetter] = useState<{
+    readonly getClerkToken: (() => Promise<string | null>) | null;
+  }>({ getClerkToken: null });
+  const { getClerkToken } = clerkTokenGetter;
+  // Stable identity so ClerkTokenBridge's effect (keyed on this callback)
+  // does not refire on every ConnectionsSettings render.
+  const handleGetClerkTokenChange = useCallback(
+    (nextGetClerkToken: (() => Promise<string | null>) | null) =>
+      setClerkTokenGetter({ getClerkToken: nextGetClerkToken }),
+    [],
+  );
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
   const registerEnvironment = useAtomCommand(environmentCatalog.register, {
     reportFailure: false,
@@ -3306,17 +3346,20 @@ export function ConnectionsSettings() {
       // above has already succeeded, so neither the Clerk token read (which can
       // hang while clerk-js is offline) nor the unlink may gate the sandbox
       // deletion or its toasts. unlinkSandboxEnvironmentFromRelay swallows and
-      // logs its own failures.
-      void getClerkToken(resolveRelayClerkTokenOptions())
-        .catch(() => null)
-        .then((clerkToken) => {
-          if (clerkToken) {
-            void unlinkSandboxEnvironmentRelayLink({
-              environmentId: pending.environment.environmentId,
-              clerkToken,
-            });
-          }
-        });
+      // logs its own failures. getClerkToken is null in cloudless builds (no
+      // ClerkProvider) — treat that like "not signed in" and skip the unlink.
+      if (getClerkToken !== null) {
+        void getClerkToken()
+          .catch(() => null)
+          .then((clerkToken) => {
+            if (clerkToken) {
+              void unlinkSandboxEnvironmentRelayLink({
+                environmentId: pending.environment.environmentId,
+                clerkToken,
+              });
+            }
+          });
+      }
 
       if (!removeSandbox) return;
       try {
@@ -3348,7 +3391,9 @@ export function ConnectionsSettings() {
     async (target: DesktopSshEnvironmentTarget) => {
       setIsAddingSavedBackend(true);
       setSavedBackendError(null);
-      const clerkToken = await getClerkToken(resolveRelayClerkTokenOptions()).catch(() => null);
+      // getClerkToken is null in cloudless builds (no ClerkProvider) — treat
+      // that like "not signed in" and connect over SSH only.
+      const clerkToken = (await getClerkToken?.().catch(() => null)) ?? null;
       const result = await connectAndLinkSandboxEnvironment({ target, label: "", clerkToken });
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
@@ -3372,7 +3417,7 @@ export function ConnectionsSettings() {
           relayLinked
             ? " with T3 Connect relay"
             : clerkToken
-              ? " over SSH — T3 Connect activation failed; reconnect to retry"
+              ? " over SSH — T3 Connect activation failed"
               : " over SSH"
         }.`,
       });
@@ -4618,6 +4663,9 @@ export function ConnectionsSettings() {
 
   return (
     <SettingsPageContainer>
+      {hasCloudPublicConfig() ? (
+        <ClerkTokenBridge onGetClerkTokenChange={handleGetClerkTokenChange} />
+      ) : null}
       {primarySettings}
       <SettingsSection
         {...searchableSetting("remote-environments")}
