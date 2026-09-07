@@ -9,6 +9,7 @@ import {
   type CloudLinkMode,
   type CloudLinkTarget,
   unlinkPrimaryEnvironmentFromCloud,
+  unlinkSandboxEnvironmentFromRelay,
   updatePrimaryCloudPreferences,
 } from "./linkEnvironment";
 
@@ -46,4 +47,13 @@ export const updatePrimaryEnvironmentPreferences = createRuntimeCommand(connecti
     readonly publishAgentActivity: boolean;
     readonly holdWebhooksWhileOffline?: boolean;
   }) => updatePrimaryCloudPreferences(input),
+});
+
+// Sandbox environments have no `CloudLinkTarget` left to call by the time
+// this runs (the local record is already removed), so this is keyed by
+// environmentId alone rather than sharing `cloudLinkConcurrency`.
+export const unlinkSandboxEnvironmentRelayLink = createRuntimeCommand(connectionAtomRuntime, {
+  label: "web:cloud:unlink-sandbox-environment-relay-link",
+  execute: (input: { readonly environmentId: string; readonly clerkToken: string }) =>
+    unlinkSandboxEnvironmentFromRelay(input),
 });

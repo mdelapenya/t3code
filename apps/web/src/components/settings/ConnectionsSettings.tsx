@@ -171,6 +171,7 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
+import { unlinkSandboxEnvironmentRelayLink as unlinkSandboxEnvironmentRelayLinkAtom } from "~/cloud/linkEnvironmentAtoms";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "~/cloud/publicConfig";
 import { RemoveT3ConnectEnvironmentDialog } from "../clerk/RemoveT3ConnectEnvironmentDialog";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
@@ -2464,6 +2465,9 @@ export function ConnectionsSettings() {
   const connectAndLinkSandboxEnvironment = useAtomCommand(connectAndLinkSandboxEnvironmentAtom, {
     reportFailure: false,
   });
+  const unlinkSandboxEnvironmentRelayLink = useAtomCommand(unlinkSandboxEnvironmentRelayLinkAtom, {
+    reportFailure: false,
+  });
   const { getToken: getClerkToken } = useAuth();
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
   const registerEnvironment = useAtomCommand(environmentCatalog.register, {
@@ -3293,7 +3297,28 @@ export function ConnectionsSettings() {
       if (pending === null) return;
       setPendingSbxRemoval(null);
       const removed = await removeSavedBackend(pending.environment);
-      if (!removed || !removeSandbox) return;
+      if (!removed) return;
+
+      // connectSandboxSshTarget links the sandbox to T3 Connect's relay, but
+      // nothing in the environment registry reverses that when the saved
+      // backend is removed, so the relay link would otherwise outlive the
+      // local record. Best effort and strictly fire-and-forget: the removal
+      // above has already succeeded, so neither the Clerk token read (which can
+      // hang while clerk-js is offline) nor the unlink may gate the sandbox
+      // deletion or its toasts. unlinkSandboxEnvironmentFromRelay swallows and
+      // logs its own failures.
+      void getClerkToken(resolveRelayClerkTokenOptions())
+        .catch(() => null)
+        .then((clerkToken) => {
+          if (clerkToken) {
+            void unlinkSandboxEnvironmentRelayLink({
+              environmentId: pending.environment.environmentId,
+              clerkToken,
+            });
+          }
+        });
+
+      if (!removeSandbox) return;
       try {
         await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
         toastManager.add({
@@ -3311,7 +3336,7 @@ export function ConnectionsSettings() {
         );
       }
     },
-    [pendingSbxRemoval, removeSavedBackend],
+    [getClerkToken, pendingSbxRemoval, removeSavedBackend, unlinkSandboxEnvironmentRelayLink],
   );
 
   // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it
