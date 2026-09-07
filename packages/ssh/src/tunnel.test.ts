@@ -318,6 +318,28 @@ describe("ssh tunnel scripts", () => {
     );
   });
 
+  it("only passes --scope to the remote pairing CLI when scopes are requested", () => {
+    const stateKey = "711bc738002d72fd";
+    // A remote host may run an older `t3` that hard-fails on an unknown flag,
+    // so the default command line must stay byte-identical.
+    assert.include(
+      SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE),
+      '"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json',
+    );
+    assert.notInclude(SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE), "--scope");
+    assert.notInclude(SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE, {}), "--scope");
+    assert.notInclude(
+      SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE, { scopes: [] }),
+      "--scope",
+    );
+    assert.include(
+      SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE, {
+        scopes: ["orchestration:read", "relay:write"],
+      }),
+      `"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --scope 'orchestration:read' --scope 'relay:write' --json`,
+    );
+  });
+
   it.effect("accepts launch JSON after remote shell startup noise", () => {
     const target = {
       alias: "devbox",

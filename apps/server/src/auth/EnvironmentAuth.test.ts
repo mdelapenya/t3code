@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   authScopeResponse,
   AuthAdministrativeScopes,
+  AuthRelayWriteScope,
   AuthStandardClientScopes,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -403,6 +404,37 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         )
         .pipe(Effect.flip);
       expect(reused._tag).toBe("ServerAuthInvalidCredentialError");
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
+  it.effect("carries relay:write into access tokens when the pairing grant includes it", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      // Mirrors the SSH pairing path: the credential is minted with the wider
+      // scope set, and the exchange (which cannot widen) inherits the grant.
+      const relayPairing = yield* serverAuth.createPairingLink({
+        scopes: [...AuthStandardClientScopes, AuthRelayWriteScope],
+      });
+
+      const token = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        relayPairing.credential,
+        undefined,
+        requestMetadata,
+      );
+
+      expect(token.scope?.split(" ")).toContain(AuthRelayWriteScope);
+
+      // Asking for the wider set cannot widen a standard grant: the exchange
+      // narrows to what the grant holds, which is why relay:write has to be
+      // present when the credential is minted.
+      const standardPairing = yield* serverAuth.createPairingLink();
+      const narrowed = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        standardPairing.credential,
+        [...AuthStandardClientScopes, AuthRelayWriteScope],
+        requestMetadata,
+      );
+
+      expect(narrowed.scope?.split(" ")).not.toContain(AuthRelayWriteScope);
     }).pipe(Effect.provide(layerEnvironmentAuth())),
   );
 

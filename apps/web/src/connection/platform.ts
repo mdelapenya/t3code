@@ -23,11 +23,13 @@ import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/enviro
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
 import {
+  AuthRelayWriteScope,
   AuthStandardClientScopes,
   type DesktopBridge,
   type DesktopEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
   type EnvironmentId,
+  isSbxSshHostname,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -181,6 +183,18 @@ function sshPreparationError(cause: unknown) {
   });
 }
 
+/**
+ * Docker Sandbox environments link themselves to the T3 Connect relay right
+ * after registration, which the relay endpoints gate behind `relay:write`.
+ * Plain SSH targets keep the standard client grant so their remote pairing
+ * command line — and any older remote `t3` that would reject a new flag —
+ * stays untouched.
+ */
+const sshPairingScopeOptions = (target: DesktopSshEnvironmentTarget) =>
+  isSbxSshHostname(target.hostname)
+    ? { pairingScopes: [...AuthStandardClientScopes, AuthRelayWriteScope] }
+    : {};
+
 export const provisionDesktopSshEnvironment = Effect.fn(
   "web.connectionPlatform.ssh.provisionDesktop",
 )(function* (
@@ -192,6 +206,7 @@ export const provisionDesktopSshEnvironment = Effect.fn(
     try: () =>
       bridge.ensureSshEnvironment(target, {
         issuePairingToken: true,
+        ...sshPairingScopeOptions(target),
       }),
     catch: sshPreparationError,
   });
@@ -297,6 +312,7 @@ const layerCapabilities = Layer.effectContext(
           try: () =>
             bridge.ensureSshEnvironment(input.target, {
               issuePairingToken: true,
+              ...sshPairingScopeOptions(input.target),
             }),
           catch: sshPreparationError,
         });
