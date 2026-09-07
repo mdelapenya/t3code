@@ -3023,7 +3023,8 @@ export function ConnectionsSettings() {
   // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it
   // also attempts T3 Connect relay activation so mobile and remote clients can
   // reach the sandbox agent without being on this desktop host. Relay failure is
-  // non-fatal inside the command, so a success here may still be SSH-only.
+  // non-fatal inside the command, so a success here may still be SSH-only —
+  // `result.value.relayLinked` tells us which, and the toast copy reflects it.
   const connectSandboxSshTarget = useCallback(
     async (target: DesktopSshEnvironmentTarget) => {
       setIsAddingSavedBackend(true);
@@ -3044,10 +3045,17 @@ export function ConnectionsSettings() {
       setSavedBackendSshUsername("");
       setSavedBackendSshPort("");
       setAddBackendDialogOpen(false);
+      const { relayLinked } = result.value;
       toastManager.add({
         type: "success",
         title: "Sandbox connected",
-        description: `${target.alias} is ready${clerkToken ? " with T3 Connect relay" : " over SSH"}.`,
+        description: `${target.alias} is ready${
+          relayLinked
+            ? " with T3 Connect relay"
+            : clerkToken
+              ? " over SSH — T3 Connect activation failed; reconnect to retry"
+              : " over SSH"
+        }.`,
       });
       setIsAddingSavedBackend(false);
     },

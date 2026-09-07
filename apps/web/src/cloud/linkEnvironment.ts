@@ -20,6 +20,7 @@ import {
   type RelayManagedEndpointProviderKind,
 } from "@t3tools/contracts/relay";
 import { EnvironmentRegistry } from "@t3tools/client-runtime/connection";
+import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import {
   makeEnvironmentHttpApiClient,
   remoteHttpClientLayer,
@@ -241,9 +242,10 @@ export function unlinkPrimaryEnvironmentFromCloud(input: {
         })
         .pipe(
           Effect.catch((cause) =>
-            Effect.logWarning("Could not revoke cloud environment link after local unlink.", {
-              cause,
-            }),
+            Effect.logWarning(
+              "Could not revoke cloud environment link after local unlink.",
+              safeErrorLogAttributes(cause),
+            ),
           ),
         );
     }

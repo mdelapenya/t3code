@@ -2,6 +2,7 @@ import {
   ConnectionOnboarding,
   type SshRegistrationResult,
 } from "@t3tools/client-runtime/connection";
+import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import {
   createAtomCommandScheduler,
   createRuntimeCommand,
@@ -47,8 +48,10 @@ export const connectSshEnvironment = createRuntimeCommand(connectionAtomRuntime,
  * from mobile and remote clients.
  *
  * Relay activation is fire-and-forget: a failure is logged as a warning and
- * does not roll back the SSH registration. The user can retry via the T3
- * Connect toggle on the environment settings page.
+ * does not roll back the SSH registration. The result reports whether relay
+ * activation succeeded via `relayLinked` so the caller can be honest about it;
+ * there is no dedicated retry control for a sandbox environment, but
+ * reconnecting the sandbox (running this command again) re-attempts the link.
  */
 export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionAtomRuntime, {
   label: "web:connection:connect-and-link-sandbox",
@@ -74,27 +77,30 @@ export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionA
         ...(input.label === undefined ? {} : { label: input.label }),
       });
 
-      if (input.clerkToken) {
-        const target: CloudLinkTarget = {
-          environmentId: registration.environmentId,
-          label: input.label?.trim() || input.target.alias,
-          httpBaseUrl: registration.httpBaseUrl,
-          wsBaseUrl: registration.wsBaseUrl,
-        };
-        yield* linkSandboxEnvironmentToCloud({
-          target,
-          clerkToken: input.clerkToken,
-          bearerToken: registration.bearerToken,
-        }).pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("Sandbox relay activation failed; SSH connection still succeeded.", {
-              message: error.message,
-              cause: error.cause,
-            }),
-          ),
-        );
+      if (!input.clerkToken) {
+        return { registration, relayLinked: false };
       }
 
-      return registration;
+      const target: CloudLinkTarget = {
+        environmentId: registration.environmentId,
+        label: input.label?.trim() || input.target.alias,
+        httpBaseUrl: registration.httpBaseUrl,
+        wsBaseUrl: registration.wsBaseUrl,
+      };
+      const relayLinked = yield* linkSandboxEnvironmentToCloud({
+        target,
+        clerkToken: input.clerkToken,
+        bearerToken: registration.bearerToken,
+      }).pipe(
+        Effect.as(true),
+        Effect.catch((error) =>
+          Effect.logWarning(
+            "Sandbox relay activation failed; SSH connection still succeeded.",
+            safeErrorLogAttributes(error),
+          ).pipe(Effect.as(false)),
+        ),
+      );
+
+      return { registration, relayLinked };
     }),
 });
