@@ -208,6 +208,16 @@ the section above applies, including reconnects and server updates. Removing it
 from **Settings → Connections** asks whether to keep the sandbox running for
 later or delete it along with everything inside. Deleting cannot be undone.
 
+If you are signed in to T3 Connect, connecting a sandbox also links it to T3
+Connect, so it is reachable from the mobile app and app.t3.codes without extra
+setup. The link finishes in the background: the sandbox is usable over SSH as
+soon as it connects, and a second notification reports whether the link
+succeeded. If you are not signed in, or the link fails, the sandbox stays
+connected over SSH only. T3 Code does not retry the link on its own, and
+reconnecting does not retry it either. To try again, remove the environment and
+add it again. This link is specific to sandboxes; other SSH environments are
+not linked automatically.
+
 Docker Sandboxes has its own platform requirements (Apple silicon macOS 14+,
 Windows 11, or Ubuntu 24.04+ with KVM). See the
 [Docker Sandboxes documentation](https://docs.docker.com/ai/sandboxes/) for
