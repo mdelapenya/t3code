@@ -19,6 +19,7 @@ import { HttpClient, HttpClientResponse } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as SshAuth from "./auth.ts";
+import { remoteStateKey } from "./command.ts";
 import { SshCommandError } from "./errors.ts";
 import * as SshTunnel from "./tunnel.ts";
 
@@ -32,6 +33,23 @@ const makeSuccessfulProcess = (stdout: string) => {
     stderr: Stream.empty,
     all: stdoutStream,
     exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+    isRunning: Effect.succeed(false),
+    kill: () => Effect.void,
+    stdin: Sink.drain,
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+    unref: Effect.succeed(Effect.void),
+  });
+};
+
+const makeFailedProcess = (stderr: string) => {
+  const stderrStream = Stream.make(new TextEncoder().encode(stderr));
+  return ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(124),
+    stdout: Stream.empty,
+    stderr: stderrStream,
+    all: stderrStream,
+    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
     isRunning: Effect.succeed(false),
     kill: () => Effect.void,
     stdin: Sink.drain,
@@ -99,6 +117,23 @@ const ARCHIVE = { archiveVersion: "1.2.3-preview.20260911.4" } as const;
 const NODE_SCRIPT = {
   nodeScriptPath: "/Users/julius/Development/Work/codething-mvp/apps/server/dist/bin.mjs",
 } as const;
+
+const commandStdinText = (command: ChildProcess.Command) =>
+  Effect.gen(function* () {
+    if (command._tag !== "StandardCommand") {
+      return "";
+    }
+    const stdin = command.options.stdin;
+    if (stdin === undefined || typeof stdin === "string" || !("stream" in stdin)) {
+      return "";
+    }
+    if (typeof stdin.stream === "string") {
+      return "";
+    }
+    const chunks = yield* Stream.runCollect(stdin.stream);
+    const decoder = new TextDecoder();
+    return chunks.map((chunk) => decoder.decode(chunk)).join("");
+  });
 
 describe("ssh tunnel scripts", () => {
   it("installs and runs the release archive without Node, npm, or npx", () => {
@@ -570,6 +605,129 @@ describe("ssh tunnel scripts", () => {
       }).pipe(Effect.provide(layer), Effect.scoped);
     }),
   );
+
+  it.effect("retries the legacy pairing command line when a scoped mint fails", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    const stdinScripts: Array<string> = [];
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const script = yield* commandStdinText(command);
+        stdinScripts.push(script);
+        return script.includes("--scope")
+          ? makeFailedProcess("error: unknown option '--scope'\n")
+          : makeSuccessfulProcess('{"credential":"LCL4R2TPHDKQ"}\n');
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, {
+        scopes: ["orchestration:read", "relay:write"],
+      });
+
+      assert.equal(result.credential, "LCL4R2TPHDKQ");
+      assert.lengthOf(stdinScripts, 2);
+      assert.include(stdinScripts[0] ?? "", "--scope 'orchestration:read' --scope 'relay:write'");
+      // The retry has to be the legacy command line byte for byte, or an old
+      // CLI rejects it for the same reason the scoped one failed.
+      const stateKey = yield* remoteStateKey(target);
+      assert.equal(stdinScripts[1], SshTunnel.buildRemotePairingScript(stateKey, ARCHIVE));
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("surfaces the scoped pairing failure when the legacy retry also fails", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const script = yield* commandStdinText(command);
+        attempts += 1;
+        return makeFailedProcess(
+          script.includes("--scope") ? "scoped mint refused\n" : "legacy mint refused\n",
+        );
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(
+        SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, {
+          scopes: ["orchestration:read", "relay:write"],
+        }),
+      );
+
+      assert.equal(attempts, 2);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        assert.include(result.failure.message, "scoped mint refused");
+      }
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("does not retry an unscoped pairing mint", () => {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.com",
+      username: "julius",
+      port: 2222,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.sync(() => {
+        attempts += 1;
+        return makeFailedProcess("pairing refused\n");
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(
+        SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE),
+      );
+
+      assert.equal(attempts, 1);
+      assert.isTrue(Result.isFailure(result));
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("does not retry a scoped pairing mint that failed to authenticate", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.sync(() => {
+        attempts += 1;
+        return makeFailedProcess("agent@my-sandbox.sbx: Permission denied (publickey).\n");
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(
+        SshTunnel.issueRemotePairingToken(target, undefined, ARCHIVE, { scopes: ["relay:write"] }),
+      );
+
+      assert.equal(attempts, 1);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        assert.include(result.failure.message, "Permission denied (publickey)");
+      }
+    }).pipe(Effect.provide(processLayer));
+  });
 
   it.effect.each(["successful stop", "failed stop"] as const)(
     "closes the tunnel scope and starts fresh after a %s",
