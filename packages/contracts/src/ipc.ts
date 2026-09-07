@@ -472,7 +472,7 @@ export type DesktopSbxInstallMethod = typeof DesktopSbxInstallMethodSchema.Type;
 
 // Every sandbox is reachable over SSH at <name>.sbx (via the managed
 // ssh_config written by `sbx setup ssh`), with a fixed in-sandbox user.
-export const SBX_SSH_HOST_SUFFIX = ".sbx";
+const SBX_SSH_HOST_SUFFIX = ".sbx";
 export const SBX_SSH_USERNAME = "agent";
 
 // The t3code kit preinstalls the t3 npm package and the C++ toolchain
