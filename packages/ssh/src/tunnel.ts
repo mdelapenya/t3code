@@ -17,6 +17,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -948,7 +949,7 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
   },
 );
 
-export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingToken")(function* (
+const runRemotePairingAttempt = Effect.fn("ssh/tunnel.runRemotePairingAttempt")(function* (
   target: DesktopSshEnvironmentTarget,
   input?: SshAuthOptions,
   runner?: RemoteT3RunnerOptions,
@@ -960,11 +961,6 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   SshCommandError | SshInvalidTargetError | SshPairingError,
   ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
 > {
-  yield* Effect.logDebug("ssh.remoteServer.pairingToken.start", {
-    ...sshTargetLogFields(target),
-    stateKey: remoteStateKey(target),
-    pairingScopes: pairing?.scopes ?? null,
-  });
   const result = yield* runSshCommand(target, {
     remoteCommandArgs: ["sh", "-s"],
     stdin: buildRemotePairingScript(target, runner, pairing),
@@ -1004,6 +1000,66 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   return {
     credential: parsed.credential,
   };
+});
+
+/**
+ * Mints a remote pairing credential, degrading to the legacy unscoped command
+ * line when a scoped mint fails.
+ *
+ * Remote hosts often run a `t3` older than the desktop that drives them —
+ * Docker Sandbox images preinstall a global CLI the remote runner prefers over
+ * the pinned npx spec — and an older CLI exits non-zero on the unknown
+ * `--scopes` flag. Failing there would break SSH connectivity entirely, so a
+ * single retry on the byte-identical legacy command line keeps the environment
+ * usable with a narrower credential; the later relay link then fails cleanly
+ * and the client reports the environment as not linked. Stderr is not parsed
+ * for "unknown flag" because a genuine pairing failure fails the same way
+ * twice, and the original error is what surfaces in that case.
+ */
+export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingToken")(function* (
+  target: DesktopSshEnvironmentTarget,
+  input?: SshAuthOptions,
+  runner?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
+): Effect.fn.Return<
+  {
+    readonly credential: string;
+  },
+  SshCommandError | SshInvalidTargetError | SshPairingError,
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
+> {
+  const scopes = pairing?.scopes ?? [];
+  yield* Effect.logDebug("ssh.remoteServer.pairingToken.start", {
+    ...sshTargetLogFields(target),
+    stateKey: remoteStateKey(target),
+    pairingScopes: scopes.length === 0 ? null : scopes,
+  });
+  if (scopes.length === 0) {
+    return yield* runRemotePairingAttempt(target, input, runner);
+  }
+  const scopedAttempt = yield* Effect.result(
+    runRemotePairingAttempt(target, input, runner, { scopes }),
+  );
+  if (Result.isSuccess(scopedAttempt)) {
+    return scopedAttempt.success;
+  }
+  // An auth failure is not about the flag, and retrying would burn another
+  // authentication attempt before the caller can prompt for a secret.
+  if (isSshAuthFailure(scopedAttempt.failure)) {
+    return yield* scopedAttempt.failure;
+  }
+  yield* Effect.logWarning("ssh.remoteServer.pairingToken.scopesDropped", {
+    ...sshTargetLogFields(target),
+    stateKey: remoteStateKey(target),
+    droppedScopes: scopes,
+    errorTag: scopedAttempt.failure._tag,
+    message: scopedAttempt.failure.message,
+  });
+  const legacyAttempt = yield* Effect.result(runRemotePairingAttempt(target, input, runner));
+  if (Result.isSuccess(legacyAttempt)) {
+    return legacyAttempt.success;
+  }
+  return yield* scopedAttempt.failure;
 });
 
 const stopRemoteServer = Effect.fn("ssh/tunnel.stopRemoteServer")(function* (
