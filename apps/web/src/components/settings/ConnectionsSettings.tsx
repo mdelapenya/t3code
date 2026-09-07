@@ -155,6 +155,7 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
+import { unlinkSandboxEnvironmentRelayLink as unlinkSandboxEnvironmentRelayLinkAtom } from "~/cloud/linkEnvironmentAtoms";
 import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "~/cloud/publicConfig";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
@@ -2236,6 +2237,9 @@ export function ConnectionsSettings() {
   const connectAndLinkSandboxEnvironment = useAtomCommand(connectAndLinkSandboxEnvironmentAtom, {
     reportFailure: false,
   });
+  const unlinkSandboxEnvironmentRelayLink = useAtomCommand(unlinkSandboxEnvironmentRelayLinkAtom, {
+    reportFailure: false,
+  });
   const { getToken: getClerkToken } = useAuth();
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
   const setEnvironmentEnabled = useAtomCommand(environmentCatalog.setEnabled, {
@@ -2999,7 +3003,23 @@ export function ConnectionsSettings() {
       if (pending === null) return;
       setPendingSbxRemoval(null);
       const removed = await performRemoveSavedBackend(pending.environmentId);
-      if (!removed || !removeSandbox) return;
+      if (!removed) return;
+
+      // connectSandboxSshTarget links the sandbox to T3 Connect's relay, but
+      // nothing in the environment registry reverses that when the saved
+      // backend is removed, so the relay link would otherwise outlive the
+      // local record. Best effort: unlinkSandboxEnvironmentFromRelay swallows
+      // and logs its own failures, so a relay hiccup here never blocks this
+      // removal, which has already succeeded.
+      const clerkToken = await getClerkToken(resolveRelayClerkTokenOptions()).catch(() => null);
+      if (clerkToken) {
+        void unlinkSandboxEnvironmentRelayLink({
+          environmentId: pending.environmentId,
+          clerkToken,
+        });
+      }
+
+      if (!removeSandbox) return;
       try {
         await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
         toastManager.add({
@@ -3017,7 +3037,7 @@ export function ConnectionsSettings() {
         );
       }
     },
-    [pendingSbxRemoval, performRemoveSavedBackend],
+    [getClerkToken, pendingSbxRemoval, performRemoveSavedBackend, unlinkSandboxEnvironmentRelayLink],
   );
 
   // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it

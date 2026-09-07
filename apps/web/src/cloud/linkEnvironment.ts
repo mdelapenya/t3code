@@ -464,3 +464,47 @@ export function linkSandboxEnvironmentToCloud(input: {
       .pipe(Effect.mapError(environmentApiError("Could not configure sandbox relay access.")));
   }).pipe(Effect.provide(remoteHttpClientLayer(globalThis.fetch)));
 }
+
+/**
+ * Best-effort relay unlink for a Docker Sandbox environment that is being
+ * removed from the local registry. `linkSandboxEnvironmentToCloud` creates a
+ * relay-side environment link, but neither the client registry's `remove`
+ * nor the relay server itself ever revokes it on removal, so the local
+ * record disappearing otherwise leaves an orphaned link behind.
+ *
+ * This targets the relay directly, unlike `unlinkPrimaryEnvironmentFromCloud`,
+ * which also calls the environment's own `/api/connect/unlink` first: by the
+ * time this runs the environment has already been removed from the
+ * registry, so there is no live `httpBaseUrl` left to reach.
+ *
+ * The relay's unlink endpoint is idempotent — unlinking an environment that
+ * was never linked (or is already unlinked) comes back as `ok: false`, not
+ * an error — so no "not found" special-casing is needed here. Any real
+ * failure (auth, network, relay outage) is logged as a warning and
+ * swallowed: this must never block or fail the environment removal it
+ * follows.
+ */
+export function unlinkSandboxEnvironmentFromRelay(input: {
+  readonly environmentId: string;
+  readonly clerkToken: string;
+}): Effect.Effect<void, never, ManagedRelay.ManagedRelayClient> {
+  return Effect.gen(function* () {
+    const configuredRelayUrl = relayUrl();
+    if (!configuredRelayUrl) return;
+
+    const relayClient = yield* ManagedRelay.ManagedRelayClient;
+    yield* relayClient
+      .unlinkEnvironment({
+        clerkToken: input.clerkToken,
+        environmentId: EnvironmentId.make(input.environmentId),
+      })
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning(
+            "Could not revoke cloud environment link after sandbox removal.",
+            safeErrorLogAttributes(cause),
+          ),
+        ),
+      );
+  });
+}

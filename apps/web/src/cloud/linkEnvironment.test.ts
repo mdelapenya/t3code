@@ -30,6 +30,7 @@ import {
   readPrimaryCloudLinkState,
   type CloudLinkTarget,
   unlinkPrimaryEnvironmentFromCloud,
+  unlinkSandboxEnvironmentFromRelay,
   updatePrimaryCloudPreferences,
 } from "./linkEnvironment";
 
@@ -390,6 +391,37 @@ describe("web cloud link environment client", () => {
       expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
         `/v1/client/environment-links/${TARGET.environmentId}`,
       );
+    }),
+  );
+
+  it.effect("revokes the relay link for a removed sandbox environment", () =>
+    Effect.gen(function* () {
+      const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ ok: true }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      yield* unlinkSandboxEnvironmentFromRelay({
+        environmentId: TARGET.environmentId,
+        clerkToken: "clerk-token",
+      }).pipe(Effect.provide(relayLayer()));
+
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+        `/v1/client/environment-links/${TARGET.environmentId}`,
+      );
+    }),
+  );
+
+  it.effect("swallows a failed sandbox relay unlink instead of throwing", () =>
+    Effect.gen(function* () {
+      // Never-linked environments come back as `{ ok: false }`, not an
+      // error, so this exercises a genuine relay failure (e.g. an outage)
+      // to prove it is logged and swallowed rather than propagated to the
+      // caller — a relay hiccup here must never block environment removal.
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("relay unavailable")));
+
+      yield* unlinkSandboxEnvironmentFromRelay({
+        environmentId: TARGET.environmentId,
+        clerkToken: "clerk-token",
+      }).pipe(Effect.provide(relayLayer()));
     }),
   );
 });
