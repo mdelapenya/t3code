@@ -1,4 +1,5 @@
 import type {
+  AuthEnvironmentScope,
   DesktopDiscoveredSshHost,
   DesktopSshEnvironmentBootstrap,
   DesktopSshEnvironmentTarget,
@@ -56,7 +57,10 @@ export class DesktopSshEnvironment extends Context.Service<
     ) => Effect.Effect<DesktopSshEnvironmentTarget, SshCommandError | SshInvalidTargetError>;
     readonly ensureEnvironment: (
       target: DesktopSshEnvironmentTarget,
-      options?: { readonly issuePairingToken?: boolean },
+      options?: {
+        readonly issuePairingToken?: boolean;
+        readonly pairingScopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+      },
     ) => Effect.Effect<DesktopSshEnvironmentBootstrap, DesktopSshEnvironmentOperationError>;
     readonly disconnectEnvironment: (
       target: DesktopSshEnvironmentTarget,

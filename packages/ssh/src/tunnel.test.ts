@@ -315,6 +315,29 @@ describe("ssh tunnel scripts", () => {
     );
   });
 
+  it("only passes --scopes to the remote pairing CLI when scopes are requested", () => {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.com",
+      username: "julius",
+      port: 2222,
+    } as const;
+    // A remote host may run an older `t3` that hard-fails on an unknown flag,
+    // so the default command line must stay byte-identical.
+    const defaultPairingCommand =
+      '"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json';
+    assert.include(buildRemotePairingScript(target), defaultPairingCommand);
+    assert.notInclude(buildRemotePairingScript(target), "--scopes");
+    assert.notInclude(buildRemotePairingScript(target, undefined, {}), "--scopes");
+    assert.notInclude(buildRemotePairingScript(target, undefined, { scopes: [] }), "--scopes");
+    assert.include(
+      buildRemotePairingScript(target, undefined, {
+        scopes: ["orchestration:read", "relay:write"],
+      }),
+      `"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --scopes 'orchestration:read,relay:write' --json`,
+    );
+  });
+
   it.effect("accepts launch JSON after remote shell startup noise", () => {
     const target = {
       alias: "devbox",

@@ -1,5 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthAdministrativeScopes } from "@t3tools/contracts";
+import {
+  AuthAdministrativeScopes,
+  AuthRelayWriteScope,
+  AuthStandardClientScopes,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -367,6 +371,36 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         .pipe(Effect.flip);
 
       expect(error._tag).toBe("ServerAuthScopeNotGrantedError");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("carries relay:write into access tokens when the pairing grant includes it", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      // Mirrors the SSH pairing path: the credential is minted with the wider
+      // scope set, and the exchange (which cannot widen) inherits the grant.
+      const relayPairing = yield* serverAuth.createPairingLink({
+        scopes: [...AuthStandardClientScopes, AuthRelayWriteScope],
+      });
+
+      const token = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        relayPairing.credential,
+        undefined,
+        requestMetadata,
+      );
+
+      expect(token.scope?.split(" ")).toContain(AuthRelayWriteScope);
+
+      const standardPairing = yield* serverAuth.createPairingLink();
+      const clamped = yield* serverAuth
+        .exchangeBootstrapCredentialForAccessToken(
+          standardPairing.credential,
+          [...AuthStandardClientScopes, AuthRelayWriteScope],
+          requestMetadata,
+        )
+        .pipe(Effect.flip);
+
+      expect(clamped._tag).toBe("ServerAuthScopeNotGrantedError");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 

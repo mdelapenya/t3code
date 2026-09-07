@@ -8,6 +8,8 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AuthRelayWriteScope,
+  AuthStandardClientScopes,
   CommandId,
   EnvironmentOrchestrationHttpApi,
   ProviderInstanceId,
@@ -624,6 +626,76 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       assert.equal(listed.length, 1);
       assert.equal(listed[0]?.id, created.id);
       assert.equal("credential" in (listed[0] ?? {}), false);
+    }),
+  );
+
+  it.effect("mints pairing credentials with the scopes the caller asked for", () =>
+    Effect.gen(function* () {
+      const baseDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-auth-pairing-scopes-test-"),
+      );
+      const requestedScopes = [...AuthStandardClientScopes, AuthRelayWriteScope];
+
+      const createdOutput = yield* captureStdout(
+        runCli([
+          "auth",
+          "pairing",
+          "create",
+          "--base-dir",
+          baseDir,
+          // Surrounding whitespace is tolerated so callers can pass a readable list.
+          "--scopes",
+          `${requestedScopes.join(", ")}`,
+          "--json",
+        ]),
+      );
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const created = JSON.parse(createdOutput.output) as {
+        readonly id: string;
+        readonly scopes: ReadonlyArray<string>;
+      };
+      const listedOutput = yield* captureStdout(
+        runCli(["auth", "pairing", "list", "--base-dir", baseDir, "--json"]),
+      );
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const listed = JSON.parse(listedOutput.output) as ReadonlyArray<{
+        readonly id: string;
+        readonly scopes: ReadonlyArray<string>;
+      }>;
+
+      // Docker Sandbox pairing needs relay:write, which the standard client
+      // grant omits — the grant, not the exchange, is where it has to appear.
+      assert.deepEqual(created.scopes, requestedScopes);
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0]?.id, created.id);
+      assert.deepEqual(listed[0]?.scopes, requestedScopes);
+    }),
+  );
+
+  it.effect("rejects unknown pairing scopes before running auth commands", () =>
+    Effect.gen(function* () {
+      const error = yield* runCliWithRuntime([
+        "auth",
+        "pairing",
+        "create",
+        "--scopes",
+        "relay:write,relay:admin",
+      ]).pipe(Effect.flip);
+
+      if (!CliError.isCliError(error)) {
+        assert.fail(`Expected CliError, got ${String(error)}`);
+      }
+      if (error._tag !== "ShowHelp") {
+        assert.fail(`Expected ShowHelp, got ${error._tag}`);
+      }
+      assert.deepEqual(error.commandPath, ["t3", "auth", "pairing", "create"]);
+      const scopeError = error.errors[0] as CliError.CliError | undefined;
+      if (!scopeError || scopeError._tag !== "InvalidValue") {
+        assert.fail(`Expected InvalidValue, got ${String(scopeError?._tag)}`);
+      }
+      assert.equal(scopeError.option, "scopes");
+      assert.isTrue(scopeError.message.includes("Unknown scope: relay:admin"));
+      assert.isTrue(scopeError.message.includes(AuthRelayWriteScope));
     }),
   );
 

@@ -1,4 +1,5 @@
 import type {
+  AuthEnvironmentScope,
   DesktopSshEnvironmentBootstrap,
   DesktopSshEnvironmentTarget,
 } from "@t3tools/contracts";
@@ -85,6 +86,15 @@ export interface RemoteT3RunnerOptions {
   readonly releaseBaseUrl?: string | null;
 }
 
+/**
+ * Scopes the remote pairing credential must carry. Left empty for ordinary SSH
+ * targets so their pairing command line does not change; Docker Sandbox
+ * environments ask for `relay:write` so T3 Connect linking can succeed.
+ */
+export interface RemotePairingOptions {
+  readonly scopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+}
+
 export interface SshEnvironmentManagerOptions {
   readonly resolveCliRunner?: Effect.Effect<RemoteT3RunnerOptions>;
 }
@@ -157,7 +167,10 @@ interface SshAuthAttemptInput<T> extends SshAuthOperationInput<T> {
 export interface SshEnvironmentManagerShape {
   readonly ensureEnvironment: (
     target: DesktopSshEnvironmentTarget,
-    options?: { readonly issuePairingToken?: boolean },
+    options?: {
+      readonly issuePairingToken?: boolean;
+      readonly pairingScopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+    },
   ) => Effect.Effect<
     DesktopSshEnvironmentBootstrap,
     SshEnvironmentEffectError,
@@ -733,7 +746,7 @@ cat >"$RUNNER_FILE" <<'SH'
 SH
 chmod 700 "$RUNNER_FILE"
 PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
-"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json
+"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR"@@T3_PAIRING_SCOPES_FLAG@@ --json
 `;
 
 const REMOTE_STOP_SCRIPT = `set -eu
@@ -845,11 +858,22 @@ export function buildRemoteLaunchScript(input?: RemoteT3RunnerOptions): string {
 export function buildRemotePairingScript(
   target: DesktopSshEnvironmentTarget,
   input?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
 ): string {
   return applyScriptPlaceholders(REMOTE_PAIRING_SCRIPT, {
     T3_STATE_KEY: remoteStateKey(target),
     T3_RUNNER_SCRIPT: stripTrailingNewlines(buildRemoteT3RunnerScript(input)),
+    // Older remote `t3` builds reject an unknown `--scopes` flag, so the
+    // command line stays byte-identical whenever no scopes are requested.
+    T3_PAIRING_SCOPES_FLAG: pairingScopesFlag(pairing?.scopes),
   });
+}
+
+function pairingScopesFlag(scopes: ReadonlyArray<string> | undefined): string {
+  if (scopes === undefined || scopes.length === 0) {
+    return "";
+  }
+  return ` --scopes ${shellSingleQuote(scopes.join(","))}`;
 }
 
 export function buildRemoteStopScript(target: DesktopSshEnvironmentTarget): string {
@@ -928,6 +952,7 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   target: DesktopSshEnvironmentTarget,
   input?: SshAuthOptions,
   runner?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
 ): Effect.fn.Return<
   {
     readonly credential: string;
@@ -938,10 +963,11 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   yield* Effect.logDebug("ssh.remoteServer.pairingToken.start", {
     ...sshTargetLogFields(target),
     stateKey: remoteStateKey(target),
+    pairingScopes: pairing?.scopes ?? null,
   });
   const result = yield* runSshCommand(target, {
     remoteCommandArgs: ["sh", "-s"],
-    stdin: buildRemotePairingScript(target, runner),
+    stdin: buildRemotePairingScript(target, runner, pairing),
     // Pairing may be the first command on a cold remote, so it can install
     // the archive on the way.
     ...(isNodeScriptRunner(runner) ? {} : { timeoutMs: REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS }),
@@ -1654,7 +1680,10 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 
   const ensureEnvironment = Effect.fn("ssh/tunnel.ensureEnvironment")(function* (
     target: DesktopSshEnvironmentTarget,
-    requestOptions?: { readonly issuePairingToken?: boolean },
+    requestOptions?: {
+      readonly issuePairingToken?: boolean;
+      readonly pairingScopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+    },
   ): Effect.fn.Return<
     DesktopSshEnvironmentBootstrap,
     SshEnvironmentEffectError,
@@ -1663,6 +1692,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
     yield* Effect.logInfo("ssh.environment.ensure.start", {
       ...sshTargetLogFields(target),
       issuePairingToken: requestOptions?.issuePairingToken === true,
+      pairingScopes: requestOptions?.pairingScopes ?? null,
     });
     const baseResolved = yield* resolveSshTarget(target.alias || target.hostname);
     const resolvedTarget: DesktopSshEnvironmentTarget = {
@@ -1692,7 +1722,9 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
               key,
               target: entry.target,
               operation: (authOptions) =>
-                issueRemotePairingToken(entry.target, authOptions, runner),
+                issueRemotePairingToken(entry.target, authOptions, runner, {
+                  scopes: requestOptions?.pairingScopes,
+                }),
             })
           : null;
         const pairingToken = pairingResult?.credential ?? null;
