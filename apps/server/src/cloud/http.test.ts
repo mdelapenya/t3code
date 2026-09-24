@@ -38,6 +38,7 @@ import {
   pendingServiceUpdateExists,
   reconcileDesiredCloudLink,
   releaseManagedTunnelOnShutdown,
+  resolveSignedEndpointOrigin,
 } from "./http.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "./traceRelayRequest.ts";
@@ -182,6 +183,85 @@ describe("relay request tracing", () => {
       expect(Option.getOrUndefined(span.parent)?.spanId).toBe("0123456789abcdef");
     }),
   );
+});
+
+describe("resolveSignedEndpointOrigin", () => {
+  // A Docker Sandbox is reached over `ssh -L 54321:127.0.0.1:3773`, so the
+  // link request arrives on the desktop-side 54321 while the cloudflared
+  // connector inside the sandbox has to dial the server's own 3773.
+  const SANDBOX_REQUEST_URL = "http://127.0.0.1:54321/api/t3-cloud/link-proof";
+
+  it("signs the server's own listening port when the request arrived over a port forward", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 54321 },
+        requestUrl: SANDBOX_REQUEST_URL,
+        listeningPort: 3773,
+      }),
+    ).toEqual({ localHttpHost: "127.0.0.1", localHttpPort: 3773 });
+  });
+
+  it("leaves a direct loopback link unchanged", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
+        requestUrl: "http://127.0.0.1:3773/api/t3-cloud/link-proof",
+        listeningPort: 3773,
+      }),
+    ).toEqual({ localHttpHost: "127.0.0.1", localHttpPort: 3773 });
+  });
+
+  it("rejects a port the request did not arrive on", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 9999 },
+        requestUrl: SANDBOX_REQUEST_URL,
+        listeningPort: 3773,
+      }),
+    ).toBeNull();
+  });
+
+  // The claim is still checked against the request port, so a client cannot
+  // steer the signed origin even by naming the port it will be given.
+  it("rejects a claimed listening port that does not match the request port", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
+        requestUrl: SANDBOX_REQUEST_URL,
+        listeningPort: 3773,
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects a non-loopback claimed origin", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "attacker.example.test", localHttpPort: 54321 },
+        requestUrl: SANDBOX_REQUEST_URL,
+        listeningPort: 3773,
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects a request that did not arrive over loopback", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 443 },
+        requestUrl: "https://environment.example.test/api/t3-cloud/link-proof",
+        listeningPort: 3773,
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to the requested origin when the listening port is unknown", () => {
+    expect(
+      resolveSignedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 54321 },
+        requestUrl: SANDBOX_REQUEST_URL,
+        listeningPort: null,
+      }),
+    ).toEqual({ localHttpHost: "127.0.0.1", localHttpPort: 54321 });
+  });
 });
 
 describe("reconcileDesiredCloudLink", () => {

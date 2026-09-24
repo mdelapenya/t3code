@@ -51,7 +51,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as HttpEffect from "effect/unstable/http/HttpEffect";
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
@@ -60,6 +60,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { requireEnvironmentScope } from "../auth/http.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { resolveListeningPort } from "../startupAccess.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import {
   SERVICE_STATE_FILE,
@@ -313,6 +314,39 @@ function isAllowedEndpointOrigin(input: {
   return input.origin.localHttpPort === endpointRequestPort(url);
 }
 
+/**
+ * Origin to sign into a link proof, or `null` when the request must be
+ * rejected.
+ *
+ * The relay bakes this origin into the managed tunnel's ingress config, and
+ * the cloudflared connector that reads it runs beside this server. So the only
+ * correct value is the loopback socket this process actually listens on, not
+ * the port the request happened to arrive on. Those agree for a client talking
+ * straight to the server, but a Docker Sandbox is reached through
+ * `ssh -L <localPort>:127.0.0.1:<remotePort>`: the request carries the
+ * desktop-side `localPort` while the connector inside the sandbox must dial
+ * `remotePort`. Signing the request port there points the tunnel at a port
+ * nothing is listening on, and the link "succeeds" while unreachable.
+ *
+ * The caller's claim is still validated exactly as before, so a mismatched or
+ * non-loopback origin is refused rather than quietly corrected; only the
+ * signed port is taken from this server instead of from the request. A server
+ * with no TCP port to report (unix socket) signs the claim as it always did.
+ */
+export function resolveSignedEndpointOrigin(input: {
+  readonly origin: RelayManagedEndpointOrigin;
+  readonly requestUrl: string;
+  /** This server's real listening port, or `null` when it has none. */
+  readonly listeningPort: number | null;
+}): RelayManagedEndpointOrigin | null {
+  if (!isAllowedEndpointOrigin({ origin: input.origin, requestUrl: input.requestUrl })) {
+    return null;
+  }
+  return input.listeningPort === null
+    ? input.origin
+    : { ...input.origin, localHttpPort: input.listeningPort };
+}
+
 // A managed (Cloudflare tunnel) endpoint is provisioned by the relay and must
 // point at a loopback origin. A manual endpoint is reached out of band (e.g.
 // Tailscale) or not advertised at all for publish-only links, so it is not
@@ -361,6 +395,25 @@ interface CloudHttpDependencies {
   readonly environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"];
   readonly cliTokenManager: CliTokenManager.CloudCliTokenManager["Service"];
   readonly httpClient: HttpClient.HttpClient;
+  /**
+   * Present whenever these dependencies are built inside a serving HTTP stack,
+   * which is how the link-proof handler learns the port a managed tunnel must
+   * dial. Absent in call paths built outside it, which then fall back to the
+   * requested origin.
+   */
+  readonly httpServer: Option.Option<HttpServer.HttpServer["Service"]>;
+}
+
+/**
+ * The port this server is really listening on. Not client-controlled, so it is
+ * safe to sign. `null` when there is no TCP port to report.
+ */
+function serverListeningPort(dependencies: CloudHttpDependencies): number | null {
+  const port = Option.match(dependencies.httpServer, {
+    onNone: () => 0,
+    onSome: (server) => resolveListeningPort(server.address, 0),
+  });
+  return port > 0 ? port : null;
 }
 
 const cloudHttpDependencies = Effect.gen(function* () {
@@ -371,6 +424,7 @@ const cloudHttpDependencies = Effect.gen(function* () {
     environmentAuth: yield* EnvironmentAuth.EnvironmentAuth,
     cliTokenManager: yield* CliTokenManager.CloudCliTokenManager,
     httpClient: yield* HttpClient.HttpClient,
+    httpServer: yield* Effect.serviceOption(HttpServer.HttpServer),
   } satisfies CloudHttpDependencies;
 });
 
@@ -380,13 +434,14 @@ const makeCloudLinkProof = Effect.fn("environment.cloud.makeLinkProof")(function
   requestUrl: string,
 ) {
   const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
-  if (
-    !isSupportedLinkProviderKind(request) ||
-    !isAllowedEndpointOrigin({
-      origin: request.origin,
-      requestUrl,
-    })
-  ) {
+  const origin = isSupportedLinkProviderKind(request)
+    ? resolveSignedEndpointOrigin({
+        origin: request.origin,
+        requestUrl,
+        listeningPort: serverListeningPort(dependencies),
+      })
+    : null;
+  if (origin === null) {
     return yield* new EnvironmentHttpBadRequestError({
       message: "Invalid managed endpoint origin.",
     });
@@ -407,7 +462,7 @@ const makeCloudLinkProof = Effect.fn("environment.cloud.makeLinkProof")(function
     environmentId: descriptor.environmentId,
     environmentPublicKey: normalizePemForSignedPayload(keyPair.publicKey),
     endpoint: request.endpoint,
-    origin: request.origin,
+    origin,
     scopes: linkProofScopes(request),
   } satisfies RelayEnvironmentLinkProofPayload;
   return yield* signRelayJwt({
