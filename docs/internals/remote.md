@@ -62,9 +62,12 @@ Docker Sandboxes are provisioning, not a connection kind. Desktop main shells
 out to the `sbx` CLI ([apps/desktop/src/sbx](../../apps/desktop/src/sbx)) to
 install it, create a sandbox with the t3code kit preapplied, and then hands the
 resulting `<name>.sbx` host to the ordinary SSH flow above — the persisted
-profile is a plain SSH profile and nothing downstream knows sandboxes exist.
-Removing such an environment replaces the generic removal confirmation with a
-single dialog offering to keep the sandbox running or delete it.
+profile is a plain SSH profile. The web connect flow additionally activates a
+T3 Connect relay link for that host, deliberately only for sandboxes, since a
+sandbox has no other way to be reached once it leaves this machine; plain
+desktop-managed SSH connects skip that step. Removing such an environment
+replaces the generic removal confirmation with a single dialog offering to
+keep the sandbox running or delete it.
 
 ### Desktop without a local environment
 

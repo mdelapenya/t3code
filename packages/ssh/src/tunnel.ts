@@ -1,4 +1,5 @@
 import type {
+  AuthEnvironmentScope,
   DesktopSshEnvironmentBootstrap,
   DesktopSshEnvironmentTarget,
 } from "@t3tools/contracts";
@@ -16,6 +17,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -83,6 +85,15 @@ export interface RemoteT3RunnerOptions {
    */
   readonly archiveVersion?: string | null;
   readonly releaseBaseUrl?: string | null;
+}
+
+/**
+ * Scopes the remote pairing credential must carry. Left empty for ordinary SSH
+ * targets so their pairing command line does not change; Docker Sandbox
+ * environments ask for `relay:write` so T3 Connect linking can succeed.
+ */
+export interface RemotePairingOptions {
+  readonly scopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
 }
 
 export interface SshEnvironmentManagerOptions {
@@ -157,7 +168,10 @@ interface SshAuthAttemptInput<T> extends SshAuthOperationInput<T> {
 export interface SshEnvironmentManagerShape {
   readonly ensureEnvironment: (
     target: DesktopSshEnvironmentTarget,
-    options?: { readonly issuePairingToken?: boolean },
+    options?: {
+      readonly issuePairingToken?: boolean;
+      readonly pairingScopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+    },
   ) => Effect.Effect<
     DesktopSshEnvironmentBootstrap,
     SshEnvironmentEffectError,
@@ -733,7 +747,7 @@ cat >"$RUNNER_FILE" <<'SH'
 SH
 chmod 700 "$RUNNER_FILE"
 PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
-"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json
+"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR"@@T3_PAIRING_SCOPES_FLAG@@ --json
 `;
 
 const REMOTE_STOP_SCRIPT = `set -eu
@@ -845,11 +859,22 @@ export function buildRemoteLaunchScript(input?: RemoteT3RunnerOptions): string {
 export function buildRemotePairingScript(
   target: DesktopSshEnvironmentTarget,
   input?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
 ): string {
   return applyScriptPlaceholders(REMOTE_PAIRING_SCRIPT, {
     T3_STATE_KEY: remoteStateKey(target),
     T3_RUNNER_SCRIPT: stripTrailingNewlines(buildRemoteT3RunnerScript(input)),
+    // Older remote `t3` builds reject an unknown `--scopes` flag, so the
+    // command line stays byte-identical whenever no scopes are requested.
+    T3_PAIRING_SCOPES_FLAG: pairingScopesFlag(pairing?.scopes),
   });
+}
+
+function pairingScopesFlag(scopes: ReadonlyArray<string> | undefined): string {
+  if (scopes === undefined || scopes.length === 0) {
+    return "";
+  }
+  return ` --scopes ${shellSingleQuote(scopes.join(","))}`;
 }
 
 export function buildRemoteStopScript(target: DesktopSshEnvironmentTarget): string {
@@ -924,10 +949,11 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
   },
 );
 
-export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingToken")(function* (
+const runRemotePairingAttempt = Effect.fn("ssh/tunnel.runRemotePairingAttempt")(function* (
   target: DesktopSshEnvironmentTarget,
   input?: SshAuthOptions,
   runner?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
 ): Effect.fn.Return<
   {
     readonly credential: string;
@@ -935,13 +961,9 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   SshCommandError | SshInvalidTargetError | SshPairingError,
   ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
 > {
-  yield* Effect.logDebug("ssh.remoteServer.pairingToken.start", {
-    ...sshTargetLogFields(target),
-    stateKey: remoteStateKey(target),
-  });
   const result = yield* runSshCommand(target, {
     remoteCommandArgs: ["sh", "-s"],
-    stdin: buildRemotePairingScript(target, runner),
+    stdin: buildRemotePairingScript(target, runner, pairing),
     // Pairing may be the first command on a cold remote, so it can install
     // the archive on the way.
     ...(isNodeScriptRunner(runner) ? {} : { timeoutMs: REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS }),
@@ -978,6 +1000,66 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   return {
     credential: parsed.credential,
   };
+});
+
+/**
+ * Mints a remote pairing credential, degrading to the legacy unscoped command
+ * line when a scoped mint fails.
+ *
+ * Remote hosts often run a `t3` older than the desktop that drives them —
+ * Docker Sandbox images preinstall a global CLI the remote runner prefers over
+ * the pinned npx spec — and an older CLI exits non-zero on the unknown
+ * `--scopes` flag. Failing there would break SSH connectivity entirely, so a
+ * single retry on the byte-identical legacy command line keeps the environment
+ * usable with a narrower credential; the later relay link then fails cleanly
+ * and the client reports the environment as not linked. Stderr is not parsed
+ * for "unknown flag" because a genuine pairing failure fails the same way
+ * twice, and the original error is what surfaces in that case.
+ */
+export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingToken")(function* (
+  target: DesktopSshEnvironmentTarget,
+  input?: SshAuthOptions,
+  runner?: RemoteT3RunnerOptions,
+  pairing?: RemotePairingOptions,
+): Effect.fn.Return<
+  {
+    readonly credential: string;
+  },
+  SshCommandError | SshInvalidTargetError | SshPairingError,
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
+> {
+  const scopes = pairing?.scopes ?? [];
+  yield* Effect.logDebug("ssh.remoteServer.pairingToken.start", {
+    ...sshTargetLogFields(target),
+    stateKey: remoteStateKey(target),
+    pairingScopes: scopes.length === 0 ? null : scopes,
+  });
+  if (scopes.length === 0) {
+    return yield* runRemotePairingAttempt(target, input, runner);
+  }
+  const scopedAttempt = yield* Effect.result(
+    runRemotePairingAttempt(target, input, runner, { scopes }),
+  );
+  if (Result.isSuccess(scopedAttempt)) {
+    return scopedAttempt.success;
+  }
+  // An auth failure is not about the flag, and retrying would burn another
+  // authentication attempt before the caller can prompt for a secret.
+  if (isSshAuthFailure(scopedAttempt.failure)) {
+    return yield* scopedAttempt.failure;
+  }
+  yield* Effect.logWarning("ssh.remoteServer.pairingToken.scopesDropped", {
+    ...sshTargetLogFields(target),
+    stateKey: remoteStateKey(target),
+    droppedScopes: scopes,
+    errorTag: scopedAttempt.failure._tag,
+    message: scopedAttempt.failure.message,
+  });
+  const legacyAttempt = yield* Effect.result(runRemotePairingAttempt(target, input, runner));
+  if (Result.isSuccess(legacyAttempt)) {
+    return legacyAttempt.success;
+  }
+  return yield* scopedAttempt.failure;
 });
 
 const stopRemoteServer = Effect.fn("ssh/tunnel.stopRemoteServer")(function* (
@@ -1654,7 +1736,10 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 
   const ensureEnvironment = Effect.fn("ssh/tunnel.ensureEnvironment")(function* (
     target: DesktopSshEnvironmentTarget,
-    requestOptions?: { readonly issuePairingToken?: boolean },
+    requestOptions?: {
+      readonly issuePairingToken?: boolean;
+      readonly pairingScopes?: ReadonlyArray<AuthEnvironmentScope> | undefined;
+    },
   ): Effect.fn.Return<
     DesktopSshEnvironmentBootstrap,
     SshEnvironmentEffectError,
@@ -1663,6 +1748,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
     yield* Effect.logInfo("ssh.environment.ensure.start", {
       ...sshTargetLogFields(target),
       issuePairingToken: requestOptions?.issuePairingToken === true,
+      pairingScopes: requestOptions?.pairingScopes ?? null,
     });
     const baseResolved = yield* resolveSshTarget(target.alias || target.hostname);
     const resolvedTarget: DesktopSshEnvironmentTarget = {
@@ -1692,7 +1778,9 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
               key,
               target: entry.target,
               operation: (authOptions) =>
-                issueRemotePairingToken(entry.target, authOptions, runner),
+                issueRemotePairingToken(entry.target, authOptions, runner, {
+                  scopes: requestOptions?.pairingScopes,
+                }),
             })
           : null;
         const pairingToken = pairingResult?.credential ?? null;

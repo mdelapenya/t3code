@@ -7,6 +7,7 @@ import {
   RefreshCwIcon,
   TerminalIcon,
 } from "lucide-react";
+import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import { Atom } from "effect/unstable/reactivity";
 import {
@@ -154,13 +155,16 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
-import { hasCloudPublicConfig } from "~/cloud/publicConfig";
+import { unlinkSandboxEnvironmentRelayLink as unlinkSandboxEnvironmentRelayLinkAtom } from "~/cloud/linkEnvironmentAtoms";
+import { hasCloudPublicConfig, resolveRelayClerkTokenOptions } from "~/cloud/publicConfig";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
 import { environmentCatalog } from "~/connection/catalog";
 import {
+  connectAndLinkSandboxEnvironment as connectAndLinkSandboxEnvironmentAtom,
   connectPairing as connectPairingAtom,
   connectSshEnvironment as connectSshEnvironmentAtom,
+  type SandboxRelayActivationOutcome,
 } from "~/connection/onboarding";
 import { useEnvironmentQuery } from "~/state/query";
 import {
@@ -436,6 +440,31 @@ function formatDesktopSbxError(error: unknown): string {
   );
   const withoutTaggedErrorPrefix = withoutIpcPrefix.replace(/^DesktopSbx[A-Za-z]+Error:\s*/u, "");
   return withoutTaggedErrorPrefix.trim() || fallback;
+}
+
+const CLERK_TOKEN_TIMEOUT_MS = 4000;
+
+// Clerk's getToken awaits an internal "loaded" promise that only resolves once
+// clerk-js reaches ready/degraded, and that promise never rejects — so an
+// offline or blocked clerk-js would otherwise hang the caller forever. Race it
+// against a short timeout and treat a timeout like "not signed in", same as a
+// null getter or a thrown error.
+function getClerkTokenWithTimeout(
+  getClerkToken: (() => Promise<string | null>) | null,
+): Promise<string | null> {
+  if (!getClerkToken) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve(null), CLERK_TOKEN_TIMEOUT_MS);
+    getClerkToken()
+      .then((token) => {
+        window.clearTimeout(timer);
+        resolve(token ?? null);
+      })
+      .catch(() => {
+        window.clearTimeout(timer);
+        resolve(null);
+      });
+  });
 }
 
 const ENDPOINT_ROW_CLASSNAME = "first:rounded-t-xl last:rounded-b-xl px-3 py-2.5 sm:px-4";
@@ -2222,6 +2251,31 @@ function CloudRemoteEnvironmentRows({
   ) : null;
 }
 
+// Clerk's useAuth() throws when no ClerkProvider is mounted, which is the case
+// in cloudless builds (see main.tsx, which only mounts one when
+// VITE_CLERK_PUBLISHABLE_KEY is set). ConnectionsSettings itself needs Clerk's
+// token getter for sandbox relay activation, but must render (and its SSH/sandbox
+// flows must work) even without Clerk configured. Rendering this child only
+// under hasCloudPublicConfig() — same guard as CloudLinkRow — keeps the
+// useAuth() call out of ConnectionsSettings' own render, so rules-of-hooks
+// never sees it called conditionally.
+function ClerkTokenBridge({
+  onGetClerkTokenChange,
+}: {
+  readonly onGetClerkTokenChange: (getClerkToken: (() => Promise<string | null>) | null) => void;
+}) {
+  const { getToken } = useAuth();
+  useEffect(() => {
+    // Declaring this getter as `async` guarantees that a synchronous throw
+    // from resolveRelayClerkTokenOptions() (missing JWT template config)
+    // becomes a rejected promise instead of escaping the call site, so every
+    // caller's `.catch(() => null)` actually catches it.
+    onGetClerkTokenChange(async () => getToken(resolveRelayClerkTokenOptions()));
+    return () => onGetClerkTokenChange(null);
+  }, [getToken, onGetClerkTokenChange]);
+  return null;
+}
+
 export function ConnectionsSettings() {
   const desktopBridge = window.desktopBridge;
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -2231,6 +2285,28 @@ export function ConnectionsSettings() {
   const connectSshEnvironment = useAtomCommand(connectSshEnvironmentAtom, {
     reportFailure: false,
   });
+  const connectAndLinkSandboxEnvironment = useAtomCommand(connectAndLinkSandboxEnvironmentAtom, {
+    reportFailure: false,
+  });
+  const unlinkSandboxEnvironmentRelayLink = useAtomCommand(unlinkSandboxEnvironmentRelayLinkAtom, {
+    reportFailure: false,
+  });
+  // Null in cloudless builds (no ClerkProvider mounted) — see ClerkTokenBridge.
+  // Sandbox connect/remove flows treat a null getter the same as "not signed
+  // in": SSH-only, no relay link attempt. Boxed in an object because
+  // useState's setter reads a bare function argument as a functional
+  // updater, not as the value to store — wrapping sidesteps that ambiguity.
+  const [clerkTokenGetter, setClerkTokenGetter] = useState<{
+    readonly getClerkToken: (() => Promise<string | null>) | null;
+  }>({ getClerkToken: null });
+  const { getClerkToken } = clerkTokenGetter;
+  // Stable identity so ClerkTokenBridge's effect (keyed on this callback)
+  // does not refire on every ConnectionsSettings render.
+  const handleGetClerkTokenChange = useCallback(
+    (nextGetClerkToken: (() => Promise<string | null>) | null) =>
+      setClerkTokenGetter({ getClerkToken: nextGetClerkToken }),
+    [],
+  );
   const removeEnvironment = useAtomCommand(environmentCatalog.remove, { reportFailure: false });
   const setEnvironmentEnabled = useAtomCommand(environmentCatalog.setEnabled, {
     reportFailure: false,
@@ -2993,25 +3069,117 @@ export function ConnectionsSettings() {
       if (pending === null) return;
       setPendingSbxRemoval(null);
       const removed = await performRemoveSavedBackend(pending.environmentId);
-      if (!removed || !removeSandbox) return;
-      try {
-        await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
-        toastManager.add({
-          type: "success",
-          title: "Sandbox removed",
-          description: `Docker sandbox “${pending.sandboxName}” was deleted.`,
-        });
-      } catch (error) {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not remove sandbox",
-            description: formatDesktopSbxError(error),
-          }),
-        );
+      if (!removed) return;
+
+      if (removeSandbox) {
+        try {
+          await window.desktopBridge?.removeSbxSandbox?.(pending.sandboxName);
+          toastManager.add({
+            type: "success",
+            title: "Sandbox removed",
+            description: `Docker sandbox “${pending.sandboxName}” was deleted.`,
+          });
+        } catch (error) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not remove sandbox",
+              description: formatDesktopSbxError(error),
+            }),
+          );
+        }
       }
+
+      // connectSandboxSshTarget links the sandbox to T3 Connect's relay, but
+      // nothing in the environment registry reverses that when the saved
+      // backend is removed, so the relay link would otherwise outlive the
+      // local record. Best effort and strictly fire-and-forget: the removal
+      // above has already completed (and the sandbox may already be gone
+      // too), so nothing here — including the Clerk token fetch — may gate
+      // or delay it. unlinkSandboxEnvironmentFromRelay swallows and logs its
+      // own failures.
+      void getClerkTokenWithTimeout(getClerkToken).then((clerkToken) => {
+        if (clerkToken) {
+          void unlinkSandboxEnvironmentRelayLink({
+            environmentId: pending.environmentId,
+            clerkToken,
+          });
+        }
+      });
     },
-    [pendingSbxRemoval, performRemoveSavedBackend],
+    [
+      getClerkToken,
+      pendingSbxRemoval,
+      performRemoveSavedBackend,
+      unlinkSandboxEnvironmentRelayLink,
+    ],
+  );
+
+  // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it
+  // also schedules T3 Connect relay activation so mobile and remote clients can
+  // reach the sandbox agent without being on this desktop host. The command
+  // resolves as soon as SSH registration finishes — it does not wait on relay
+  // activation, so a slow or unreachable relay never holds this UI pending.
+  // `result.value.relayActivation` says only whether activation was scheduled
+  // ("pending", a token was available) or skipped (no token); it cannot yet
+  // say whether activation succeeded, so the immediate toast is worded to
+  // match. `onRelaySettled` fires later, off the command's own return path,
+  // once the background attempt actually settles, and drives a second,
+  // honest toast for that outcome.
+  const connectSandboxSshTarget = useCallback(
+    async (target: DesktopSshEnvironmentTarget) => {
+      setIsAddingSavedBackend(true);
+      setSavedBackendError(null);
+      // getClerkToken is null in cloudless builds (no ClerkProvider), and
+      // getClerkTokenWithTimeout bounds an offline/blocked clerk-js — both
+      // cases are treated like "not signed in" and connect over SSH only.
+      const clerkToken = await getClerkTokenWithTimeout(getClerkToken);
+      const onRelaySettled = (outcome: SandboxRelayActivationOutcome) => {
+        toastManager.add(
+          outcome.linked
+            ? {
+                type: "success",
+                title: "T3 Connect relay activated",
+                description: `${target.alias} is now reachable via T3 Connect relay.`,
+              }
+            : stackedThreadToast({
+                type: "error",
+                title: "T3 Connect activation failed",
+                description: `${target.alias} stays connected over SSH. Remove and re-add it to retry.`,
+              }),
+        );
+      };
+      const result = await connectAndLinkSandboxEnvironment({
+        target,
+        label: "",
+        clerkToken,
+        onRelaySettled,
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          setSavedBackendError(formatDesktopSshConnectionError(squashAtomCommandFailure(result)));
+        }
+        setIsAddingSavedBackend(false);
+        return;
+      }
+
+      setSavedBackendHost("");
+      setSavedBackendPairingCode("");
+      setSavedBackendSshHost("");
+      setSavedBackendSshUsername("");
+      setSavedBackendSshPort("");
+      setAddBackendDialogOpen(false);
+      const { relayActivation } = result.value;
+      toastManager.add({
+        type: "success",
+        title: "Sandbox connected",
+        description: `${target.alias} is ready over SSH${
+          relayActivation === "pending" ? " — activating T3 Connect relay…" : ""
+        }.`,
+      });
+      setIsAddingSavedBackend(false);
+    },
+    [connectAndLinkSandboxEnvironment, getClerkToken],
   );
 
   const visibleDesktopPairingLinks = desktopPairingLinks;
@@ -4148,6 +4316,9 @@ export function ConnectionsSettings() {
 
   return (
     <SettingsPageContainer width="wide">
+      {hasCloudPublicConfig() ? (
+        <ClerkTokenBridge onGetClerkTokenChange={handleGetClerkTokenChange} />
+      ) : null}
       {primarySettings}
       <SettingsSection
         {...searchableSetting("remote-environments")}
@@ -4226,7 +4397,7 @@ export function ConnectionsSettings() {
                           isConnecting={isAddingSavedBackend}
                           connectError={savedBackendError}
                           savedAliasKeys={savedDesktopSshEnvironmentKeys}
-                          onConnect={connectSavedBackendSshTarget}
+                          onConnect={connectSandboxSshTarget}
                         />
                       ) : (
                         renderRemoteModeBody()

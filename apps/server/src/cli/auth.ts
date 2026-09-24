@@ -1,5 +1,7 @@
 import {
   AuthAdministrativeScopes,
+  AuthEnvironmentScope,
+  AuthEnvironmentScopes,
   AuthSessionId,
   AuthStandardClientScopes,
 } from "@t3tools/contracts";
@@ -8,6 +10,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as References from "effect/References";
+import * as Schema from "effect/Schema";
+import * as SchemaIssue from "effect/SchemaIssue";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 import { Argument, Command, Flag, GlobalFlag } from "effect/unstable/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
@@ -81,11 +86,64 @@ const tokenOnlyFlag = Flag.Boolean("token-only").pipe(
   Flag.withDefault(false),
 );
 
+const knownScopes = AuthEnvironmentScope.literals.join(", ");
+
+/**
+ * Decodes the `--scopes` flag: a comma-separated scope list validated against
+ * the environment scope schema, so a typo fails the command instead of quietly
+ * minting a credential that cannot do what the caller asked for.
+ */
+const AuthEnvironmentScopeList = Schema.String.pipe(
+  Schema.decodeTo(
+    AuthEnvironmentScopes,
+    SchemaTransformation.transformEffect({
+      decode: (value) => {
+        const requested = [
+          ...new Set(
+            value
+              .split(",")
+              .map((scope) => scope.trim())
+              .filter((scope) => scope.length > 0),
+          ),
+        ];
+        if (requested.length === 0) {
+          return Effect.fail(
+            new SchemaIssue.InvalidValue({
+              message: `Provide at least one scope. Known scopes: ${knownScopes}.`,
+            }),
+          );
+        }
+        const unknown = requested.filter(
+          (scope) => !(AuthEnvironmentScope.literals as ReadonlyArray<string>).includes(scope),
+        );
+        if (unknown.length > 0) {
+          return Effect.fail(
+            new SchemaIssue.InvalidValue({
+              message: `Unknown scope${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}. Known scopes: ${knownScopes}.`,
+            }),
+          );
+        }
+        return Effect.succeed(requested as ReadonlyArray<AuthEnvironmentScope>);
+      },
+      encode: (scopes) => Effect.succeed(scopes.join(",")),
+    }),
+  ),
+);
+
+const pairingScopesFlag = Flag.String("scopes").pipe(
+  Flag.withSchema(AuthEnvironmentScopeList),
+  Flag.withDescription(
+    `Comma-separated scopes to grant. Defaults to the standard client scopes. Known scopes: ${knownScopes}.`,
+  ),
+  Flag.optional,
+);
+
 const pairingCreateCommand = Command.make("create", {
   ...authLocationFlags,
   ttl: ttlFlag,
   label: labelFlag,
   baseUrl: baseUrlFlag,
+  scopes: pairingScopesFlag,
   json: jsonFlag,
 }).pipe(
   Command.withDescription("Issue a new client pairing token."),
@@ -95,7 +153,7 @@ const pairingCreateCommand = Command.make("create", {
       (environmentAuth) =>
         Effect.gen(function* () {
           const issued = yield* environmentAuth.createPairingLink({
-            scopes: AuthStandardClientScopes,
+            scopes: Option.isSome(flags.scopes) ? flags.scopes.value : AuthStandardClientScopes,
             subject: "one-time-token",
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),

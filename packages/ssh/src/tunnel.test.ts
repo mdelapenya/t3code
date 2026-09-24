@@ -51,6 +51,23 @@ const makeSuccessfulProcess = (stdout: string) => {
   });
 };
 
+const makeFailedProcess = (stderr: string) => {
+  const stderrStream = Stream.make(new TextEncoder().encode(stderr));
+  return ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(124),
+    stdout: Stream.empty,
+    stderr: stderrStream,
+    all: stderrStream,
+    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+    isRunning: Effect.succeed(false),
+    kill: () => Effect.void,
+    stdin: Sink.drain,
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+    unref: Effect.succeed(Effect.void),
+  });
+};
+
 const makeDelayedSuccessfulProcess = (stdout: string, delayMs: number) => {
   const process = makeSuccessfulProcess(stdout);
   return {
@@ -109,6 +126,23 @@ const ARCHIVE = { archiveVersion: "1.2.3-preview.20260911.4" } as const;
 const NODE_SCRIPT = {
   nodeScriptPath: "/Users/julius/Development/Work/codething-mvp/apps/server/dist/bin.mjs",
 } as const;
+
+const commandStdinText = (command: ChildProcess.Command) =>
+  Effect.gen(function* () {
+    if (command._tag !== "StandardCommand") {
+      return "";
+    }
+    const stdin = command.options.stdin;
+    if (stdin === undefined || typeof stdin === "string" || !("stream" in stdin)) {
+      return "";
+    }
+    if (typeof stdin.stream === "string") {
+      return "";
+    }
+    const chunks = yield* Stream.runCollect(stdin.stream);
+    const decoder = new TextDecoder();
+    return chunks.map((chunk) => decoder.decode(chunk)).join("");
+  });
 
 describe("ssh tunnel scripts", () => {
   it("installs and runs the release archive without Node, npm, or npx", () => {
@@ -315,6 +349,29 @@ describe("ssh tunnel scripts", () => {
     );
   });
 
+  it("only passes --scopes to the remote pairing CLI when scopes are requested", () => {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.com",
+      username: "julius",
+      port: 2222,
+    } as const;
+    // A remote host may run an older `t3` that hard-fails on an unknown flag,
+    // so the default command line must stay byte-identical.
+    const defaultPairingCommand =
+      '"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json';
+    assert.include(buildRemotePairingScript(target, ARCHIVE), defaultPairingCommand);
+    assert.notInclude(buildRemotePairingScript(target, ARCHIVE), "--scopes");
+    assert.notInclude(buildRemotePairingScript(target, ARCHIVE, {}), "--scopes");
+    assert.notInclude(buildRemotePairingScript(target, ARCHIVE, { scopes: [] }), "--scopes");
+    assert.include(
+      buildRemotePairingScript(target, ARCHIVE, {
+        scopes: ["orchestration:read", "relay:write"],
+      }),
+      `"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --scopes 'orchestration:read,relay:write' --json`,
+    );
+  });
+
   it.effect("accepts launch JSON after remote shell startup noise", () => {
     const target = {
       alias: "devbox",
@@ -488,6 +545,124 @@ describe("ssh tunnel scripts", () => {
     return Effect.gen(function* () {
       const result = yield* issueRemotePairingToken(target, undefined, ARCHIVE);
       assert.equal(result.credential, "LCL4R2TPHDKQ");
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("retries the legacy pairing command line when a scoped mint fails", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    const stdinScripts: Array<string> = [];
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const script = yield* commandStdinText(command);
+        stdinScripts.push(script);
+        return script.includes("--scopes")
+          ? makeFailedProcess("error: unknown option '--scopes'\n")
+          : makeSuccessfulProcess('{"credential":"LCL4R2TPHDKQ"}\n');
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* issueRemotePairingToken(target, undefined, ARCHIVE, {
+        scopes: ["orchestration:read", "relay:write"],
+      });
+
+      assert.equal(result.credential, "LCL4R2TPHDKQ");
+      assert.lengthOf(stdinScripts, 2);
+      assert.include(stdinScripts[0] ?? "", "--scopes 'orchestration:read,relay:write'");
+      assert.equal(stdinScripts[1], buildRemotePairingScript(target, ARCHIVE));
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("surfaces the scoped pairing failure when the legacy retry also fails", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        const script = yield* commandStdinText(command);
+        attempts += 1;
+        return makeFailedProcess(
+          script.includes("--scopes") ? "scoped mint refused\n" : "legacy mint refused\n",
+        );
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(
+        issueRemotePairingToken(target, undefined, ARCHIVE, {
+          scopes: ["orchestration:read", "relay:write"],
+        }),
+      );
+
+      assert.equal(attempts, 2);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        assert.include(result.failure.message, "scoped mint refused");
+      }
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("does not retry an unscoped pairing mint", () => {
+    const target = {
+      alias: "devbox",
+      hostname: "devbox.example.com",
+      username: "julius",
+      port: 2222,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.sync(() => {
+        attempts += 1;
+        return makeFailedProcess("pairing refused\n");
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(issueRemotePairingToken(target, undefined, ARCHIVE));
+
+      assert.equal(attempts, 1);
+      assert.isTrue(Result.isFailure(result));
+    }).pipe(Effect.provide(processLayer));
+  });
+
+  it.effect("does not retry a scoped pairing mint that failed to authenticate", () => {
+    const target = {
+      alias: "sandbox",
+      hostname: "my-sandbox.sbx",
+      username: "agent",
+      port: null,
+    } as const;
+    let attempts = 0;
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.sync(() => {
+        attempts += 1;
+        return makeFailedProcess("agent@my-sandbox.sbx: Permission denied (publickey).\n");
+      }),
+    );
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
+    const processLayer = Layer.merge(NodeServices.layer, spawnerLayer);
+    return Effect.gen(function* () {
+      const result = yield* Effect.result(
+        issueRemotePairingToken(target, undefined, ARCHIVE, { scopes: ["relay:write"] }),
+      );
+
+      assert.equal(attempts, 1);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        assert.include(result.failure.message, "Permission denied (publickey)");
+      }
     }).pipe(Effect.provide(processLayer));
   });
 

@@ -27,9 +27,11 @@ import { __resetDesktopPrimaryAuthForTests } from "../environments/primary/deskt
 
 import {
   linkPrimaryEnvironmentToCloud,
+  linkSandboxEnvironmentToCloud,
   readPrimaryCloudLinkState,
   type CloudLinkTarget,
   unlinkPrimaryEnvironmentFromCloud,
+  unlinkSandboxEnvironmentFromRelay,
   updatePrimaryCloudPreferences,
 } from "./linkEnvironment";
 
@@ -39,6 +41,40 @@ const TARGET: CloudLinkTarget = {
   httpBaseUrl: "http://127.0.0.1:3000",
   wsBaseUrl: "ws://127.0.0.1:3000",
 };
+
+const SANDBOX_TARGET: CloudLinkTarget = {
+  environmentId: "sandbox-environment-1",
+  label: "Docker Sandbox",
+  httpBaseUrl: "http://127.0.0.1:4100",
+  wsBaseUrl: "ws://127.0.0.1:4100",
+};
+
+function sandboxChallengeResponse() {
+  return Response.json({
+    challenge: "sandbox-challenge",
+    expiresAt: "2026-06-06T00:05:00.000Z",
+  });
+}
+
+function sandboxLinkResponse(overrides?: {
+  readonly environmentId?: string;
+  readonly providerKind?: string;
+}) {
+  return Response.json({
+    ok: true,
+    environmentId: overrides?.environmentId ?? SANDBOX_TARGET.environmentId,
+    endpoint: {
+      httpBaseUrl: SANDBOX_TARGET.httpBaseUrl,
+      wsBaseUrl: SANDBOX_TARGET.wsBaseUrl,
+      providerKind: overrides?.providerKind ?? "cloudflare_tunnel",
+    },
+    endpointRuntime: null,
+    relayIssuer: "https://relay.example.test",
+    cloudUserId: "user-1",
+    environmentCredential: "environment-credential",
+    cloudMintPublicKey: "public-key",
+  });
+}
 
 const relayClientInstallDialog = vi.hoisted(() => ({
   requestConfirmation: vi.fn(),
@@ -369,6 +405,184 @@ describe("web cloud link environment client", () => {
     }),
   );
 
+  it.effect(
+    "links a sandbox environment with bearer auth and a managed-only payload, skipping relay client install",
+    () =>
+      Effect.gen(function* () {
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(sandboxChallengeResponse())
+          .mockResolvedValueOnce(Response.json("signed-sandbox-proof"))
+          .mockResolvedValueOnce(sandboxLinkResponse())
+          .mockResolvedValueOnce(
+            Response.json({ ok: true, endpointRuntimeStatus: { status: "configured" } }),
+          );
+        vi.stubGlobal("fetch", fetchMock);
+
+        yield* linkSandboxEnvironmentToCloud({
+          target: SANDBOX_TARGET,
+          clerkToken: "clerk-token",
+          bearerToken: "sandbox-bearer-token",
+        }).pipe(Effect.provide(relayLayer()));
+
+        // Unlike the primary path, sandbox linking never checks or installs
+        // the relay client: the sandbox kit is expected to pre-install
+        // cloudflared, so no EnvironmentRegistry is even provided above.
+        expect(relayClientInstallDialog.requestConfirmation).not.toHaveBeenCalled();
+
+        const [challengeCall, proofCall, linkCall, relayConfigCall] = fetchMock.mock.calls;
+
+        // Managed-only payload: always requests a managed Cloudflare tunnel,
+        // with none of the primary path's publish-only mode toggle.
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        expect(JSON.parse(bodyText(challengeCall?.[1]?.body))).toMatchObject({
+          managedTunnelsEnabled: true,
+        });
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        expect(JSON.parse(bodyText(proofCall?.[1]?.body))).toMatchObject({
+          challenge: "sandbox-challenge",
+          endpoint: { providerKind: "cloudflare_tunnel" },
+        });
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        expect(JSON.parse(bodyText(linkCall?.[1]?.body))).toMatchObject({
+          managedTunnelsEnabled: true,
+        });
+
+        // The sandbox HTTP calls authenticate with the SSH provisioning
+        // bearer token instead of the primary path's desktop session auth.
+        const proofRequest = new Request(proofCall?.[0], proofCall?.[1]);
+        expect(proofRequest.headers.get("authorization")).toBe("Bearer sandbox-bearer-token");
+        const relayConfigRequest = new Request(relayConfigCall?.[0], relayConfigCall?.[1]);
+        expect(relayConfigRequest.headers.get("authorization")).toBe("Bearer sandbox-bearer-token");
+
+        // The relay call itself is authenticated separately (via clerkToken),
+        // never with the sandbox bearer token.
+        const challengeRequest = new Request(challengeCall?.[0], challengeCall?.[1]);
+        expect(challengeRequest.headers.get("authorization")).not.toBe(
+          "Bearer sandbox-bearer-token",
+        );
+      }),
+  );
+
+  it.effect(
+    "maps a relay failure during sandbox linking to CloudEnvironmentLinkError with the relay detail",
+    () =>
+      Effect.gen(function* () {
+        const fetchMock = vi.fn().mockResolvedValueOnce(
+          Response.json(
+            {
+              _tag: "RelayAuthInvalidError",
+              code: "auth_invalid",
+              reason: "invalid_bearer",
+              traceId: "trace-sandbox-link",
+            },
+            { status: 401 },
+          ),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        const error = yield* linkSandboxEnvironmentToCloud({
+          target: SANDBOX_TARGET,
+          clerkToken: "clerk-token",
+          bearerToken: "sandbox-bearer-token",
+        }).pipe(Effect.provide(relayLayer()), Effect.flip);
+
+        // The raw ManagedRelayClientError never reaches the caller: it is
+        // mapped to the domain-level CloudEnvironmentLinkError, carrying the
+        // relay's decoded detail message and trace ID along with it.
+        expect(error).toMatchObject({
+          _tag: "CloudEnvironmentLinkError",
+          message:
+            "https://relay.example.test/v1/client/environment-link-challenges failed: Relay rejected the cloud session token.",
+          traceId: "trace-sandbox-link",
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      }),
+  );
+
+  it.effect(
+    "maps a sandbox environment HTTP failure during relay configuration to CloudEnvironmentLinkError",
+    () =>
+      Effect.gen(function* () {
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(sandboxChallengeResponse())
+          .mockResolvedValueOnce(Response.json("signed-sandbox-proof"))
+          .mockResolvedValueOnce(sandboxLinkResponse())
+          .mockResolvedValueOnce(
+            Response.json(
+              { _tag: "EnvironmentHttpForbiddenError", message: "Sandbox relay access denied." },
+              { status: 403 },
+            ),
+          );
+        vi.stubGlobal("fetch", fetchMock);
+
+        const error = yield* linkSandboxEnvironmentToCloud({
+          target: SANDBOX_TARGET,
+          clerkToken: "clerk-token",
+          bearerToken: "sandbox-bearer-token",
+        }).pipe(Effect.provide(relayLayer()), Effect.flip);
+
+        // The raw HTTP error from the sandbox environment is not leaked to
+        // the caller either; it surfaces as the same domain-level error.
+        expect(error).toMatchObject({
+          _tag: "CloudEnvironmentLinkError",
+          message: "Could not configure sandbox relay access: Sandbox relay access denied.",
+        });
+      }),
+  );
+
+  it.effect(
+    "rejects a sandbox link response naming a different environment before configuring relay access",
+    () =>
+      Effect.gen(function* () {
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(sandboxChallengeResponse())
+          .mockResolvedValueOnce(Response.json("signed-sandbox-proof"))
+          .mockResolvedValueOnce(sandboxLinkResponse({ environmentId: "some-other-environment" }));
+        vi.stubGlobal("fetch", fetchMock);
+
+        const error = yield* linkSandboxEnvironmentToCloud({
+          target: SANDBOX_TARGET,
+          clerkToken: "clerk-token",
+          bearerToken: "sandbox-bearer-token",
+        }).pipe(Effect.provide(relayLayer()), Effect.flip);
+
+        expect(error).toMatchObject({
+          _tag: "CloudEnvironmentLinkError",
+          message: "Relay returned credentials for a different environment.",
+        });
+        // Mismatched credentials are never forwarded on to relay-config.
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+      }),
+  );
+
+  it.effect(
+    "rejects a sandbox link response naming a different endpoint provider before configuring relay access",
+    () =>
+      Effect.gen(function* () {
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(sandboxChallengeResponse())
+          .mockResolvedValueOnce(Response.json("signed-sandbox-proof"))
+          .mockResolvedValueOnce(sandboxLinkResponse({ providerKind: "manual" }));
+        vi.stubGlobal("fetch", fetchMock);
+
+        const error = yield* linkSandboxEnvironmentToCloud({
+          target: SANDBOX_TARGET,
+          clerkToken: "clerk-token",
+          bearerToken: "sandbox-bearer-token",
+        }).pipe(Effect.provide(relayLayer()), Effect.flip);
+
+        expect(error).toMatchObject({
+          _tag: "CloudEnvironmentLinkError",
+          message: "Relay returned credentials for a different endpoint provider.",
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+      }),
+  );
+
   it.effect("unlinks locally before revoking the relay record", () =>
     Effect.gen(function* () {
       const fetchMock = vi
@@ -390,6 +604,37 @@ describe("web cloud link environment client", () => {
       expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
         `/v1/client/environment-links/${TARGET.environmentId}`,
       );
+    }),
+  );
+
+  it.effect("revokes the relay link for a removed sandbox environment", () =>
+    Effect.gen(function* () {
+      const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ ok: true }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      yield* unlinkSandboxEnvironmentFromRelay({
+        environmentId: TARGET.environmentId,
+        clerkToken: "clerk-token",
+      }).pipe(Effect.provide(relayLayer()));
+
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+        `/v1/client/environment-links/${TARGET.environmentId}`,
+      );
+    }),
+  );
+
+  it.effect("swallows a failed sandbox relay unlink instead of throwing", () =>
+    Effect.gen(function* () {
+      // Never-linked environments come back as `{ ok: false }`, not an
+      // error, so this exercises a genuine relay failure (e.g. an outage)
+      // to prove it is logged and swallowed rather than propagated to the
+      // caller — a relay hiccup here must never block environment removal.
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("relay unavailable")));
+
+      yield* unlinkSandboxEnvironmentFromRelay({
+        environmentId: TARGET.environmentId,
+        clerkToken: "clerk-token",
+      }).pipe(Effect.provide(relayLayer()));
     }),
   );
 });

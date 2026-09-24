@@ -163,10 +163,20 @@ what the SSH launch needs, so the first connection does not compile anything or
 depend on registry access. Two optional kits — GitHub host keys and SSH commit
 signing — are on by default and can be unchecked.
 
+If you are signed in to T3 Connect, connecting the sandbox also links it to
+T3 Connect automatically, so it stays reachable from the mobile app and
+app.t3.codes without any extra setup. If you are not signed in, the sandbox
+connects over SSH only. The same is true if the link attempt itself fails —
+the SSH connection still succeeds, but T3 Connect is not linked. To retry the
+link, remove the sandbox environment and add it again from **Existing
+sandboxes**; the underlying sandbox is untouched unless you choose to delete
+it.
+
 The sandbox appears as an SSH environment at `<name>.sbx`, and everything from
-the section above applies, including reconnects and server updates. When you
-remove the environment, T3 Code asks whether the sandbox itself should be
-deleted too, or kept running for later.
+the section above applies, including reconnects and server updates, aside
+from the T3 Connect link above, which is unique to sandboxes. When you remove
+the environment, T3 Code asks whether the sandbox itself should be deleted
+too, or kept running for later.
 
 Docker Sandboxes has its own platform requirements (Apple silicon macOS 14+,
 Windows 11, or Ubuntu 24.04+ with KVM) — see the
