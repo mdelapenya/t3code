@@ -42,18 +42,34 @@ export const connectSshEnvironment = createRuntimeCommand(connectionAtomRuntime,
     ConnectionOnboarding.pipe(Effect.flatMap((onboarding) => onboarding.registerSsh(input))),
 });
 
+/** Outcome of a background T3 Connect relay activation, once it settles. */
+export interface SandboxRelayActivationOutcome {
+  readonly linked: boolean;
+}
+
 /**
  * Registers a Docker Sandbox SSH environment and, when a Clerk token is
- * provided, immediately activates T3 Connect relay so the sandbox is reachable
- * from mobile and remote clients.
+ * provided, schedules T3 Connect relay activation so the sandbox becomes
+ * reachable from mobile and remote clients.
  *
- * Relay activation is fire-and-forget: a failure is logged as a warning and
- * does not roll back the SSH registration. The result reports whether relay
- * activation succeeded via `relayLinked` so the caller can be honest about it.
- * There is no dedicated retry control for the link, and the environment's own
- * reconnect action (`retryNow`) never re-attempts it — only removing the
- * saved environment and adding it again, which invokes this command again,
- * does.
+ * The command resolves as soon as SSH registration finishes — it does not
+ * wait on relay activation. When a Clerk token is available, relay
+ * activation is forked into a detached fiber (`Effect.forkDetach`) that
+ * keeps running after the command itself has resolved, so a slow or
+ * unreachable relay never holds the "Add Environment" UI in a pending state.
+ * `relayActivation` in the result tells the caller whether activation was
+ * scheduled (`"pending"`, a token was available) or not attempted
+ * (`"skipped"`, no token). It cannot yet say whether activation succeeded —
+ * that only becomes known when the background fiber settles.
+ *
+ * Relay activation failure is non-fatal and never rolls back the SSH
+ * registration: it is logged as a warning and, when a `onRelaySettled`
+ * callback was supplied, reported through it exactly once, off the command's
+ * own return path. `onRelaySettled` is only ever invoked when
+ * `relayActivation` resolves to `"pending"`. There is no dedicated retry
+ * control for the link, and the environment's own reconnect action
+ * (`retryNow`) never re-attempts it — only removing the saved environment and
+ * adding it again, which invokes this command again, does.
  */
 export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionAtomRuntime, {
   label: "web:connection:connect-and-link-sandbox",
@@ -67,10 +83,16 @@ export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionA
     readonly label?: string;
     /**
      * Clerk token for the signed-in T3 Connect user. When provided relay
-     * activation is attempted automatically after SSH registration. When null
+     * activation is scheduled automatically after SSH registration. When null
      * (user not signed in) registration proceeds without relay.
      */
     readonly clerkToken: string | null;
+    /**
+     * Called once, from the detached relay-activation fiber, when a
+     * scheduled activation attempt settles. Never called when no token was
+     * provided (`relayActivation: "skipped"`).
+     */
+    readonly onRelaySettled?: (outcome: SandboxRelayActivationOutcome) => void;
   }) =>
     Effect.gen(function* () {
       const onboarding = yield* ConnectionOnboarding;
@@ -80,7 +102,7 @@ export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionA
       });
 
       if (!input.clerkToken) {
-        return { registration, relayLinked: false };
+        return { registration, relayActivation: "skipped" as const };
       }
 
       const target: CloudLinkTarget = {
@@ -89,7 +111,9 @@ export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionA
         httpBaseUrl: registration.httpBaseUrl,
         wsBaseUrl: registration.wsBaseUrl,
       };
-      const relayLinked = yield* linkSandboxEnvironmentToCloud({
+      const onRelaySettled = input.onRelaySettled;
+
+      yield* linkSandboxEnvironmentToCloud({
         target,
         clerkToken: input.clerkToken,
         bearerToken: registration.bearerToken,
@@ -101,8 +125,13 @@ export const connectAndLinkSandboxEnvironment = createRuntimeCommand(connectionA
             safeErrorLogAttributes(error),
           ).pipe(Effect.as(false)),
         ),
+        Effect.tap((linked) => Effect.sync(() => onRelaySettled?.({ linked }))),
+        // Detached, not scoped/child: this fiber must keep running after the
+        // command's own effect resolves below, so a slow relay cannot hold
+        // the caller's promise (and the "Add Environment" UI) pending.
+        Effect.forkDetach,
       );
 
-      return { registration, relayLinked };
+      return { registration, relayActivation: "pending" as const };
     }),
 });

@@ -164,6 +164,7 @@ import {
   connectAndLinkSandboxEnvironment as connectAndLinkSandboxEnvironmentAtom,
   connectPairing as connectPairingAtom,
   connectSshEnvironment as connectSshEnvironmentAtom,
+  type SandboxRelayActivationOutcome,
 } from "~/connection/onboarding";
 import { useEnvironmentQuery } from "~/state/query";
 import {
@@ -3115,10 +3116,16 @@ export function ConnectionsSettings() {
   );
 
   // Sandbox variant of connectSavedBackendSshTarget: identical SSH flow, but it
-  // also attempts T3 Connect relay activation so mobile and remote clients can
-  // reach the sandbox agent without being on this desktop host. Relay failure is
-  // non-fatal inside the command, so a success here may still be SSH-only —
-  // `result.value.relayLinked` tells us which, and the toast copy reflects it.
+  // also schedules T3 Connect relay activation so mobile and remote clients can
+  // reach the sandbox agent without being on this desktop host. The command
+  // resolves as soon as SSH registration finishes — it does not wait on relay
+  // activation, so a slow or unreachable relay never holds this UI pending.
+  // `result.value.relayActivation` says only whether activation was scheduled
+  // ("pending", a token was available) or skipped (no token); it cannot yet
+  // say whether activation succeeded, so the immediate toast is worded to
+  // match. `onRelaySettled` fires later, off the command's own return path,
+  // once the background attempt actually settles, and drives a second,
+  // honest toast for that outcome.
   const connectSandboxSshTarget = useCallback(
     async (target: DesktopSshEnvironmentTarget) => {
       setIsAddingSavedBackend(true);
@@ -3127,7 +3134,27 @@ export function ConnectionsSettings() {
       // getClerkTokenWithTimeout bounds an offline/blocked clerk-js — both
       // cases are treated like "not signed in" and connect over SSH only.
       const clerkToken = await getClerkTokenWithTimeout(getClerkToken);
-      const result = await connectAndLinkSandboxEnvironment({ target, label: "", clerkToken });
+      const onRelaySettled = (outcome: SandboxRelayActivationOutcome) => {
+        toastManager.add(
+          outcome.linked
+            ? {
+                type: "success",
+                title: "T3 Connect relay activated",
+                description: `${target.alias} is now reachable via T3 Connect relay.`,
+              }
+            : stackedThreadToast({
+                type: "error",
+                title: "T3 Connect activation failed",
+                description: `${target.alias} stays connected over SSH. Remove and re-add it to retry.`,
+              }),
+        );
+      };
+      const result = await connectAndLinkSandboxEnvironment({
+        target,
+        label: "",
+        clerkToken,
+        onRelaySettled,
+      });
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           setSavedBackendError(formatDesktopSshConnectionError(squashAtomCommandFailure(result)));
@@ -3142,16 +3169,12 @@ export function ConnectionsSettings() {
       setSavedBackendSshUsername("");
       setSavedBackendSshPort("");
       setAddBackendDialogOpen(false);
-      const { relayLinked } = result.value;
+      const { relayActivation } = result.value;
       toastManager.add({
         type: "success",
         title: "Sandbox connected",
-        description: `${target.alias} is ready${
-          relayLinked
-            ? " with T3 Connect relay"
-            : clerkToken
-              ? " over SSH — T3 Connect activation failed"
-              : " over SSH"
+        description: `${target.alias} is ready over SSH${
+          relayActivation === "pending" ? " — activating T3 Connect relay…" : ""
         }.`,
       });
       setIsAddingSavedBackend(false);
