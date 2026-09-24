@@ -642,6 +642,23 @@ const make = Effect.gen(function* () {
     ) {
       return yield* new CloudLinkOriginInvalidError({ origin: "endpoint" });
     }
+    // The relay bakes this origin into the managed tunnel's ingress config, and
+    // the cloudflared connector that reads it runs beside this server -- so the
+    // only correct port is the loopback socket this process actually listens on,
+    // not the one the request arrived on. The two agree for a client talking
+    // straight to the server, but a Docker Sandbox is reached through
+    // `ssh -L <localPort>:127.0.0.1:<remotePort>`: the request carries the
+    // desktop-side localPort while the connector inside the sandbox has to dial
+    // remotePort. Signing the request port there aims the tunnel at a port
+    // nothing listens on, and linking reports success while the environment is
+    // unreachable. The claim above is still validated as-is, so a mismatched or
+    // non-loopback origin is refused rather than quietly corrected; only the
+    // signed port comes from this server instead of from the request.
+    const address = httpServer.address;
+    if (typeof address === "string" || !("port" in address)) {
+      return yield* new CloudLinkInternalError({ operation: "resolve-server-origin" });
+    }
+    const signedOriginPort = address.port;
     const now = yield* DateTime.now;
     const expiresAt = DateTime.add(now, { minutes: 5 });
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
@@ -658,7 +675,7 @@ const make = Effect.gen(function* () {
       environmentId: descriptor.environmentId,
       environmentPublicKey: normalizePemForSignedPayload(keyPair.publicKey),
       endpoint: request.endpoint,
-      origin: request.origin,
+      origin: { ...request.origin, localHttpPort: signedOriginPort },
       scopes: linkProofScopes(request),
     } satisfies RelayEnvironmentLinkProofPayload;
     return yield* signRelayJwt({

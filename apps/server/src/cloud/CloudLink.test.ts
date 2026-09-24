@@ -1,11 +1,13 @@
 import { EnvironmentId } from "@t3tools/contracts";
+import type { RelayLinkProofRequest } from "@t3tools/contracts/relay";
+import { decodeRelayJwt } from "@t3tools/shared/relayJwt";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
-import { HttpClient, HttpServer } from "effect/http";
+import { HttpClient, HttpServer, type HttpServerRequest } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
@@ -272,3 +274,136 @@ it.effect("an update the client walks away from still finishes", () => {
     }),
   );
 });
+
+/**
+ * The relay bakes the signed origin into the managed tunnel's ingress config,
+ * and the connector reading it runs beside this server, so the signed port has
+ * to be the one this process is bound to. A Docker Sandbox makes the two differ:
+ * it is reached over `ssh -L 54321:127.0.0.1:3773`, so the request arrives on the
+ * desktop-side 54321 while the connector inside the sandbox must dial 3773.
+ */
+const SERVER_PORT = 3773;
+const FORWARDED_PORT = 54321;
+
+const linkProofRequest = (claimedPort: number): RelayLinkProofRequest => ({
+  challenge: "challenge",
+  relayIssuer: "https://relay.example.test",
+  endpoint: {
+    httpBaseUrl: `http://127.0.0.1:${claimedPort}`,
+    wsBaseUrl: `ws://127.0.0.1:${claimedPort}`,
+    providerKind: "cloudflare_tunnel",
+  },
+  origin: { localHttpHost: "127.0.0.1", localHttpPort: claimedPort },
+});
+
+/** Arrived on `port` over loopback, with no proxy rewriting the authority. */
+const requestArrivingOn = (port: number) =>
+  ({
+    originalUrl: `http://127.0.0.1:${port}/api/t3-connect/link-proof`,
+    headers: {},
+  }) as unknown as HttpServerRequest.HttpServerRequest;
+
+const withLinkProof = <A, E>(
+  body: (linkProof: CloudLink.CloudLink["Service"]["linkProof"]) => Effect.Effect<A, E, never>,
+) =>
+  Effect.gen(function* () {
+    const link = yield* CloudLink.CloudLink;
+    return yield* body(link.linkProof);
+  }).pipe(
+    Effect.provide(
+      CloudLink.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerSecretStore.layer,
+            Layer.mock(ServerEnvironment.ServerEnvironment)({
+              getDescriptor: Effect.succeed({
+                environmentId: EnvironmentId.make("environment-1"),
+                label: "Test",
+                platform: { os: "linux", arch: "x64" },
+                serverVersion: "0.0.0",
+                capabilities: { repositoryIdentity: false },
+              }),
+            }),
+            Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({}),
+            Layer.mock(ManagedEndpointRuntime.CloudManagedEndpointRuntime)({}),
+            Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+            Layer.mock(CliTokenManager.CloudCliTokenManager)({}),
+            Layer.mock(HttpServer.HttpServer)({
+              address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", SERVER_PORT),
+            }),
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.die("unused")),
+            ),
+          ).pipe(
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), { prefix: "t3-cloud-link-proof-test-" }),
+            ),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    ),
+  );
+
+it.effect("signs this server's own listening port, not the port the request arrived on", () =>
+  withLinkProof((linkProof) =>
+    Effect.gen(function* () {
+      const proof = yield* linkProof(
+        linkProofRequest(FORWARDED_PORT),
+        requestArrivingOn(FORWARDED_PORT),
+      );
+
+      assert.deepEqual(decodeRelayJwt(proof).origin, {
+        localHttpHost: "127.0.0.1",
+        localHttpPort: SERVER_PORT,
+      });
+    }),
+  ),
+);
+
+it.effect("signs the same port a direct loopback caller reached", () =>
+  withLinkProof((linkProof) =>
+    Effect.gen(function* () {
+      const proof = yield* linkProof(linkProofRequest(SERVER_PORT), requestArrivingOn(SERVER_PORT));
+
+      assert.deepEqual(decodeRelayJwt(proof).origin, {
+        localHttpHost: "127.0.0.1",
+        localHttpPort: SERVER_PORT,
+      });
+    }),
+  ),
+);
+
+// The claim is still checked against the arrival port, so a caller cannot steer
+// the signed origin even by naming the port it wants the tunnel pointed at.
+it.effect("refuses a claimed origin the request did not arrive on", () =>
+  withLinkProof((linkProof) =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        linkProof(linkProofRequest(SERVER_PORT), requestArrivingOn(FORWARDED_PORT)),
+      );
+
+      assert.equal(error._tag, "CloudLinkOriginInvalidError");
+    }),
+  ),
+);
+
+it.effect("refuses a non-loopback claimed origin", () =>
+  withLinkProof((linkProof) =>
+    Effect.gen(function* () {
+      const request = linkProofRequest(FORWARDED_PORT);
+      const error = yield* Effect.flip(
+        linkProof(
+          {
+            ...request,
+            origin: { localHttpHost: "attacker.example.test", localHttpPort: FORWARDED_PORT },
+          },
+          requestArrivingOn(FORWARDED_PORT),
+        ),
+      );
+
+      assert.equal(error._tag, "CloudLinkOriginInvalidError");
+    }),
+  ),
+);

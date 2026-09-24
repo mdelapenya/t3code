@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import type { RelayLinkProofRequest } from "@t3tools/contracts/relay";
 
 import {
+  isAllowedEndpointOrigin,
   isSupportedLinkProviderKind,
   linkProofScopes,
   parseManagedEndpointLocalOrigin,
@@ -37,6 +38,51 @@ describe("parseManagedEndpointLocalOrigin", () => {
     "http://127.0.0.1:3773#fragment",
   ])("rejects non-origin URL %s", (input) => {
     expect(() => parseManagedEndpointLocalOrigin(input)).toThrow("Invalid local origin");
+  });
+});
+
+// A link may only point at a loopback origin the caller actually reached this
+// server on. The port the proof gets signed with is resolved separately, from
+// the bound socket, so this check is purely about refusing a claim rather than
+// correcting one.
+describe("isAllowedEndpointOrigin", () => {
+  it.each(["127.0.0.1", "localhost", "::1"])(
+    "accepts loopback claim %s on the request port",
+    (localHttpHost) => {
+      expect(
+        isAllowedEndpointOrigin({
+          origin: { localHttpHost, localHttpPort: 3773 },
+          requestUrl: "http://127.0.0.1:3773/api/t3-connect/link-proof",
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it("rejects a port the request did not arrive on", () => {
+    expect(
+      isAllowedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 9999 },
+        requestUrl: "http://127.0.0.1:3773/api/t3-connect/link-proof",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a non-loopback claimed origin", () => {
+    expect(
+      isAllowedEndpointOrigin({
+        origin: { localHttpHost: "attacker.example.test", localHttpPort: 3773 },
+        requestUrl: "http://127.0.0.1:3773/api/t3-connect/link-proof",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a request that did not arrive over loopback", () => {
+    expect(
+      isAllowedEndpointOrigin({
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 443 },
+        requestUrl: "https://environment.example.test/api/t3-connect/link-proof",
+      }),
+    ).toBe(false);
   });
 });
 
