@@ -87,14 +87,20 @@ jobs:
             --verbose
 
       # Apple silicon refuses to launch binaries without any signature, so give
-      # the unsigned bundle an ad-hoc one and ship it as a second archive.
+      # the unsigned bundle an ad-hoc one and ship it as a second archive. The
+      # packaging script stages in a temp dir and only copies the finished
+      # .dmg/.zip into release/, so the app is taken back out of that zip.
       - name: Ad-hoc sign the app bundle
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          app="$(find release/mac-arm64 -maxdepth 1 -name '*.app' -print -quit)"
+          zip="$(find release -maxdepth 1 -name 'T3-Code-*-arm64.zip' -print -quit)"
+          test -n "$zip"
+          rm -rf adhoc && mkdir adhoc
+          ditto -x -k "$zip" adhoc
+          app="$(find adhoc -maxdepth 1 -name '*.app' -print -quit)"
           test -n "$app"
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
