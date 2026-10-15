@@ -1,0 +1,112 @@
+name: Dogfood macOS build
+
+# Fork-only helper: packages an unsigned, ad-hoc-signed macOS arm64 build of any
+# ref so it can be downloaded and run by hand. Mirrors the steps release.yml and
+# release-desktop.yml perform, minus Apple signing and notarization. The version
+# uses the `-pr.` preview form so the app ships without an update feed and never
+# replaces itself with an upstream release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: feat/docker-sandbox-connections
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dogfood-macos-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build macOS arm64 (unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      # Same checkout shape as the repo's own workflows: the vendored .repos
+      # tree holds orphaned gitlinks that break actions/checkout's cleanup.
+      - name: Checkout
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ inputs.ref }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
+          echo "Building $(git rev-parse --short=12 HEAD)"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Set build version and public configuration
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version="$(node -p "require('./apps/desktop/package.json').version")"
+          version="${base_version}-pr.dogfood.${GITHUB_RUN_NUMBER}"
+          node scripts/update-release-package-versions.ts "$version"
+          # Public T3 Connect identifiers (Clerk publishable key, relay URL).
+          cp .env.example .env
+          grep -v '^#' .env | grep '=' >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Package macOS app
+        shell: bash
+        run: |
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "${{ steps.version.outputs.version }}" \
+            --skip-build \
+            --verbose
+
+      # Apple silicon refuses to launch binaries without any signature, so give
+      # the unsigned bundle an ad-hoc one and ship it as a second archive.
+      - name: Ad-hoc sign the app bundle
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          app="$(find release/mac-arm64 -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "release/T3-Code-${VERSION}-arm64-adhoc-signed.zip"
+          ls -la release/
+
+      - name: Upload build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: t3code-macos-arm64-${{ steps.version.outputs.version }}
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 7
